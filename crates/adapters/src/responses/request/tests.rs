@@ -1953,6 +1953,234 @@ fn function_call_output_becomes_tool_message_with_placeholder_assistant() {
 }
 
 #[test]
+fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
+    // 真机稳定性测试发现:即使 wire 桥接通了 + tool description 有 V4A
+    // 规则,DeepSeek 在 chat-path 上仍会反复尝试错误的 anchor / Add+Update
+    // 组合 / 空文件 Update 等无效路径,平均每次任务摸索 1-3 分钟。为节省
+    // tokens 和提升首次成功率,adapter 在 tools 数组里注册了 apply_patch
+    // 的 turn 注入一段独立 system message 告知 chat-path 实战 workaround。
+    let out = convert(json!({
+        "input": [{"type": "message", "role": "user", "content": "edit foo.py"}],
+        "instructions": "You are a coding assistant.",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Use the `apply_patch` tool to edit files."
+        }]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+
+    // Codex CLI 原 instructions 必须保留在第一条
+    assert_eq!(messages[0]["role"], "system");
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("coding assistant"),
+        "Codex 原 instructions 不应被覆盖"
+    );
+
+    // 紧跟在 Codex instructions 之后必须有一条 adapter-injected guidance
+    assert_eq!(messages[1]["role"], "system");
+    let guidance = messages[1]["content"].as_str().unwrap_or_default();
+    assert!(
+        guidance.contains("apply_patch chat-path guidance"),
+        "注入的指引必须带可识别 marker:{guidance}"
+    );
+    // 关键规则覆盖(round 4 capture 实证根因修复后):
+    // (1) `@@` 单端语法(NEVER trailing `@@`)— 旧版双端误导已删除
+    // 注意:用精确大写 "NEVER add a trailing" 匹配本规则,不能用小写 "never"
+    // (会被 "whenever" 等无关词的子串误命中,Devin pre-merge review 修复)。
+    assert!(
+        guidance.contains("SINGLE-SIDED") && guidance.contains("NEVER add a trailing"),
+        "guidance 必须强调 @@ 单端语法 + 禁尾随 @@:{guidance}"
+    );
+    assert!(
+        !guidance.contains("EMPTY LINE as the `@@` anchor"),
+        "旧版 EMPTY LINE anchor 误导已删除:{guidance}"
+    );
+    // (2) Add File 全 `+` 前缀(对抗 `def main():` 当 invalid hunk header)
+    assert!(
+        guidance.contains("prefix EVERY line") && guidance.contains("`+`"),
+        "guidance 必须强调 Add File 全 `+` 前缀:{guidance}"
+    );
+    // (3) byte-exact matching
+    assert!(
+        guidance.contains("byte-for-byte"),
+        "guidance 必须含 byte-exact 匹配规则:{guidance}"
+    );
+    // (4) Add+Update 同 path conflict
+    assert!(guidance.contains("Add File") && guidance.contains("Update File"));
+    // (5) 空文件 + lone `+` APPEND + Delete+Add fallback 兜底
+    assert!(guidance.contains("empty file") || guidance.contains("totally empty"));
+    assert!(guidance.contains("APPEND") || guidance.contains("append"));
+    assert!(
+        guidance.contains("Delete File + Add File"),
+        "guidance 必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{guidance}"
+    );
+}
+
+#[test]
+fn apply_patch_chat_path_guidance_skipped_when_tool_not_registered() {
+    // 非 apply_patch 任务不应注入指引,避免污染 token / 模型注意力
+    let out = convert(json!({
+        "input": [{"type": "message", "role": "user", "content": "list files"}],
+        "instructions": "You are a coding assistant.",
+        "tools": [{
+            "type": "function",
+            "name": "shell_command",
+            "description": "Run a shell command",
+            "parameters": {"type": "object", "properties": {}}
+        }]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let has_guidance = messages.iter().any(|m| {
+        m["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("apply_patch chat-path guidance")
+    });
+    assert!(
+        !has_guidance,
+        "无 apply_patch 注册时不应注入 chat-path guidance"
+    );
+}
+
+#[test]
+fn apply_patch_chat_path_guidance_skipped_when_previous_response_id_set() {
+    // Devin pre-merge review BUG 修复:带 previous_response_id 的后续 turn,
+    // history 已经从 session cache 拼回来(其中含上一轮注入的 guidance),
+    // 当前 turn **不应**再注入,否则每 turn 累积一份 ~2KB,N 轮后 N 份
+    // 浪费 token + 挤出上下文。
+    let out = convert(json!({
+        "input": [{"type": "message", "role": "user", "content": "another edit"}],
+        "instructions": "You are a coding assistant.",
+        "previous_response_id": "resp_18b_some_prior",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Use the `apply_patch` tool to edit files."
+        }]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let guidance_count = messages
+        .iter()
+        .filter(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("apply_patch chat-path guidance")
+        })
+        .count();
+    assert_eq!(
+        guidance_count, 0,
+        "后续 turn(previous_response_id 非空)不应再注入 guidance(history 已含)"
+    );
+}
+
+#[test]
+fn apply_patch_chat_path_guidance_idempotent_across_turns() {
+    // 防止 merge_consecutive_system_messages 把 adapter-injected guidance
+    // 跟 Codex instructions 拼到一起后,反复 convert 时被重复累积(连发 3 个
+    // turn,每 turn 转换出的 messages 里仍只含 1 段 guidance)。
+    let one_turn = json!({
+        "input": [{"type": "message", "role": "user", "content": "edit"}],
+        "instructions": "You are helpful.",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "edit"
+        }]
+    });
+    for _ in 0..3 {
+        let out = convert(one_turn.clone());
+        let guidance_count = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or_default())
+            .filter(|c| c.contains("apply_patch chat-path guidance"))
+            .count();
+        assert_eq!(guidance_count, 1, "每次 convert 仅注入一次 guidance");
+    }
+}
+
+#[test]
+fn custom_tool_call_input_item_lowered_to_assistant_tool_calls() {
+    // 回归保护(issue #235):turn N+1 Codex CLI 回放上一轮的
+    // `ResponseItem::CustomToolCall { name, input, call_id }`,我们必须把它
+    // 转成 chat completions 的 `assistant.tool_calls` 形态(function-call),
+    // 否则模型完全看不到上一轮 apply_patch 调用 → 多轮上下文丢失。
+    // arguments 必须是 JSON 字符串 `{"input":"<V4A>"}`,与首轮在请求侧
+    // lowering 的形态保持一致,模型才不失忆。
+    let patch_text = "*** Begin Patch\n*** Update File: a.py\n@@\n-x\n+y\n*** End Patch\n";
+    let out = convert(json!({
+        "input": [{
+            "type": "custom_tool_call",
+            "id": "ctc_1",
+            "call_id": "call_ap_1",
+            "name": "apply_patch",
+            "input": patch_text,
+            "status": "completed",
+        }]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let assistant = messages
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["tool_calls"].is_array())
+        .expect("custom_tool_call 应当映射成 assistant.tool_calls");
+    let tc = &assistant["tool_calls"][0];
+    assert_eq!(tc["type"], "function");
+    assert_eq!(tc["id"], "call_ap_1");
+    assert_eq!(tc["function"]["name"], "apply_patch");
+    // arguments 是 JSON 字符串值。serde_json 解一次得到 {input: <V4A>},
+    // 再 V4A 的换行已被正常 JSON-escape(`\n` 字面值)。
+    let args_str = tc["function"]["arguments"].as_str().unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(args_str).expect("arguments 必须是合法 JSON");
+    assert_eq!(parsed["input"], patch_text);
+}
+
+#[test]
+fn custom_tool_call_output_input_item_lowered_to_role_tool() {
+    // 回归保护(issue #235):`ResponseItem::CustomToolCallOutput { call_id, output }`
+    // 回放时必须转成 chat 端的 `role:"tool"` message,tool_call_id 跟前面的
+    // assistant.tool_calls.id 配对,否则 chat 上游会因 orphan tool message 400。
+    let out = convert(json!({
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_ap_2",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Add File: b.md\n+hi\n*** End Patch\n",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_ap_2",
+                "output": "Patch applied successfully",
+            }
+        ]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let tool_msg = messages
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("custom_tool_call_output 应当映射成 role:tool");
+    assert_eq!(tool_msg["tool_call_id"], "call_ap_2");
+    assert_eq!(tool_msg["content"], "Patch applied successfully");
+    // 同 PR 还要保证 assistant 在 tool 前(orphan repair 不会插占位)
+    let assistant_idx = messages
+        .iter()
+        .position(|m| m["role"] == "assistant")
+        .unwrap();
+    let tool_idx = messages.iter().position(|m| m["role"] == "tool").unwrap();
+    assert!(
+        assistant_idx < tool_idx,
+        "assistant.tool_calls 必须在 role:tool 之前出现"
+    );
+}
+
+#[test]
 fn function_call_output_non_string_is_json_serialized() {
     // 走完整 convert 路径(global cache 在生产里就这条路);
     // 这里只关心 content 序列化,不关心占位 assistant 行为(见上一条测试)。
@@ -2644,6 +2872,115 @@ fn tools_custom_type_is_lowered_to_function_with_input() {
         "string"
     );
     assert_eq!(tool["function"]["parameters"]["required"][0], "input");
+    // 非 apply_patch 的 custom 工具仍透传 outer description,input 用泛指
+    // 兜底描述,不注入 V4A 提示。
+    assert_eq!(tool["function"]["description"], "anything");
+    assert!(
+        tool["function"]["parameters"]["properties"]["input"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("verbatim"),
+        "非 apply_patch 应保留泛指 input 描述,实际:{}",
+        tool["function"]["parameters"]["properties"]["input"]["description"]
+    );
+}
+
+#[test]
+fn tools_custom_apply_patch_injects_v4a_format_hint() {
+    // 回归保护(issue #235):chat 上游(DeepSeek 等)拿到 freeform apply_patch
+    // 时,上游的 "do not wrap in JSON" 描述会误导模型;且原始描述里没有 V4A
+    // 格式样例。adapter 必须替换描述为 chat 路径准确的 V4A 指引,模型才能
+    // 正确填充 `input` 字段。
+    let out = convert(json!({
+        "input": "hi",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON."
+        }]
+    }));
+    let tool = &out["tools"][0];
+    assert_eq!(tool["type"], "function");
+    assert_eq!(tool["function"]["name"], "apply_patch");
+
+    // outer description 必须替换(不能保留误导性的 "do not wrap" 文本)
+    let outer = tool["function"]["description"].as_str().unwrap_or_default();
+    assert!(!outer.contains("do not wrap"), "误导性原描述未替换:{outer}");
+    assert!(
+        outer.contains("V4A"),
+        "outer description 应当包含 V4A 关键字:{outer}"
+    );
+    assert!(
+        outer.contains("*** Begin Patch"),
+        "outer description 应当含 V4A 边界标记:{outer}"
+    );
+
+    // input 参数描述必须含 V4A 格式约束(provider 可能更看 parameter desc)
+    let input_desc = tool["function"]["parameters"]["properties"]["input"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        input_desc.contains("V4A") && input_desc.contains("*** Begin Patch"),
+        "input description 应含 V4A 与边界标记:{input_desc}"
+    );
+
+    // 回归保护(issue #235 真机验证暴露的二级问题):tool 描述必须显式解释
+    // hunk semantics —— context 锚点 vs space-prefixed 行的区别。DeepSeek 在没
+    // 有 lark grammar 强约束的 chat 路径上反复栽在这里(把 anchor 当 space 行
+    // 重复一次),花 20 分钟、25+ 次 retry 最后 fallback 到 sed。description
+    // 必须含可执行的最小示例 + 显式的"do not repeat the anchor"指引。
+    // 关键断言(round 4 真机 capture 修复后):
+    // (1) 单端 `@@ <header>` 语法(禁双端 `@@ ... @@` — round 4 根因)
+    assert!(
+        outer.contains("single-sided") && outer.contains("@@"),
+        "tool description 必须显式说明 @@ 单端语法:{outer}"
+    );
+    let outer_lc = outer.to_lowercase();
+    assert!(
+        outer_lc.contains("never write a trailing")
+            || outer_lc.contains("never add a trailing")
+            || outer.contains("no trailing `@@`"),
+        "必须显式禁止尾随 @@:{outer}"
+    );
+    // (2) Add File 全 `+` 前缀(对抗 `def main():` 当 invalid hunk header)
+    assert!(
+        outer.contains("prefix EVERY line") || outer.contains("prefixed with `+`"),
+        "Add File 必须强调每行 `+` 前缀:{outer}"
+    );
+    // (3) byte-exact matching(对抗 Failed to find context)
+    assert!(
+        outer.contains("byte-for-byte") || outer.contains("byte-exact"),
+        "必须含 byte-exact 匹配规则:{outer}"
+    );
+    // (4) 完整 V4A example 必须包含
+    assert!(
+        outer.contains("*** Update File:") && outer.contains("@@ fn main()"),
+        "必须包含一个最小可执行 V4A Update example:{outer}"
+    );
+    assert!(
+        outer.contains("*** Add File: hello.py"),
+        "必须包含一个 Add File example:{outer}"
+    );
+    // (5) Delete + Add File fallback 兜底(Update 反复失败时)
+    assert!(
+        outer.contains("Delete File + Add File"),
+        "必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{outer}"
+    );
+
+    // 参数描述紧凑版必须含同样核心规则(round 4 修复后)
+    assert!(
+        input_desc.contains("single-sided") && input_desc.contains("@@"),
+        "input description 必须含 @@ 单端语法紧凑版:{input_desc}"
+    );
+    let input_lc = input_desc.to_lowercase();
+    assert!(
+        input_lc.contains("never write a trailing") || input_desc.contains("trailing `@@`"),
+        "input description 必须含禁尾随 @@ 紧凑版:{input_desc}"
+    );
+    assert!(
+        input_desc.contains("byte-exact") || input_desc.contains("byte-for-byte"),
+        "input description 必须含 byte-exact 紧凑版:{input_desc}"
+    );
 }
 
 #[test]

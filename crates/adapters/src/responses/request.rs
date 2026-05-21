@@ -296,6 +296,31 @@ fn build_messages_from_input(
         messages.push(msg);
     }
 
+    // 紧跟 Codex CLI 自带 instructions 之后注入 apply_patch chat-path 指引
+    // (仅当本 turn 真正注册了 apply_patch 工具 **且** 本轮是 first turn 时)。
+    // 位置选择:Codex 系统指令之后,user input 之前 — 既不污染 Codex 原指令,
+    // 又确保模型在读完工具列表准备调 apply_patch 时已经见过 chat-path 限制。
+    //
+    // **仅 first turn 注入**(Devin pre-merge review BUG 修复):带
+    // `previous_response_id` 的后续 turn,`merge_messages_with_previous_response`
+    // 把 cached history 拼到 current_messages 前面,history 已经包含上一轮注入的
+    // guidance(session_cache 保存 merged messages)。如果继续注入,每 turn 都会
+    // 加一份 ~2KB guidance,N 轮后 N 份,token 浪费 + 长 apply_patch 工作流
+    // (5-10 turn)上下文被挤出。merge 阶段只去重 `messages[0]` instructions,
+    // 不去重 guidance(它在 index 1),所以必须 caller 这里做 turn-gating。
+    //
+    // 边界:如果 first turn 没注册 apply_patch、中段 turn 才首次注册,会 miss
+    // 注入 — 实测罕见(Codex Desktop 启动即注册 apply_patch tool),且 tool
+    // description 本身已含完整 V4A 规则,模型仍能正确生成 patch。
+    let is_first_turn = body
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true);
+    if is_first_turn && tools_register_apply_patch(body) {
+        messages.push(apply_patch_chat_guidance_message());
+    }
+
     let current_messages = body
         .get("input")
         .map(input_field_to_messages)
@@ -499,6 +524,70 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
         }
         "function_call_output" => {
             // call_id 字段在 Codex CLI 历史里偶尔会以 tool_call_id / id 别名出现
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("tool_call_id").and_then(|v| v.as_str()))
+                .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_owned();
+            let output_value = item
+                .get("output")
+                .cloned()
+                .unwrap_or(Value::String(String::new()));
+            let output_str =
+                normalize_tool_output_for_context(Some(call_id.as_str()), output_value);
+            vec![json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": output_str,
+            })]
+        }
+        "custom_tool_call" => {
+            // Codex CLI 把 freeform apply_patch 的回放 wire 包成
+            // `ResponseItem::CustomToolCall { name, input, call_id, ... }`
+            // (`codex-rs/protocol/src/models.rs:824-832`)。我们在 turn N 通过
+            // `converter.rs::close_tool_call` apply_patch 分支 emit 了它;
+            // Codex CLI 在 turn N+1 把同一 item 通过 `input[]` 回放给我们。
+            // 转下游 chat completions 时必须重新打包成 `assistant.tool_calls`
+            // 的 `type:"function"` 形态(chat 端不认 custom_tool_call),且
+            // `function.arguments` 必须是 JSON 字符串 `{"input":"<V4A>"}`
+            // (与首轮在 `tools.rs::convert_responses_tool_to_chat_tool` 的
+            // `"custom" =>` 分支 lowering 形态保持一致)—— 模型才不会因
+            // wire 形态变化失忆。
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_owned();
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let input_text = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
+            // arguments 必须是 chat function-call 的标准 JSON 字符串形态。
+            // serde_json::to_string 自动处理换行 / 引号 / 反斜杠等所有转义。
+            let arguments_json = serde_json::to_string(&json!({ "input": input_text }))
+                .unwrap_or_else(|_| {
+                    // to_string 在 input 是 valid UTF-8 string 时不会失败;若
+                    // 真发生,fallback 到空对象保持下游 chat schema 合法。
+                    "{}".to_owned()
+                });
+            let arguments = sanitize_tool_arguments_json_string(&arguments_json);
+            vec![json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": if call_id.is_empty() { "call_unknown".to_owned() } else { call_id },
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                }],
+            })]
+        }
+        "custom_tool_call_output" => {
+            // `ResponseItem::CustomToolCallOutput { call_id, output, ... }`
+            // (`codex-rs/protocol/src/models.rs:839-847`)使用与 function_call_output
+            // 相同的 `output` payload encoding(string 或 content_items array)。
+            // 转 chat 时只需把 wire item type 对齐到普通 `role:"tool"` message,
+            // tool_call_id 来源仍按 call_id / tool_call_id / id 三级兜底。
             let call_id = item
                 .get("call_id")
                 .and_then(|v| v.as_str())
@@ -2207,4 +2296,71 @@ mod tests;
 
 use tools::{
     contains_kimi_web_search_tool, convert_responses_tool_to_chat_tool, normalize_tool_choice,
+    APPLY_PATCH_TOOL_NAME,
 };
+
+/// chat-path 实战指引,作为独立 `role:"system"` 注入,仅在该 turn 的 tools
+/// 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试。
+///
+/// **本版本(round 4 capture 实证根因修复)** :
+/// 旧版第 1 条"Use an EMPTY LINE as the `@@` anchor"是事实错误 — 上游
+/// V4A 官方规范(`codex-rs/core/prompt_with_apply_patch_instructions.md`
+/// L298-314)的 `@@` 是**单端语法**:`@@ <header>` 命名 class/function 等
+/// section,**不带尾随 `@@`**。旧版误写为 `@@ <context> @@` 双端 + 推荐
+/// "empty content as anchor" 双重错误导致 Codex Desktop V4A applier
+/// 全程匹配失败(`Failed to find context '... @@'`)。本次修订:
+///   1. 删除 EMPTY LINE anchor 建议(误导)
+///   2. 显式说明 `@@` 单端语法 + 给出 `@@ class X` / `@@ def f():` 示例
+///   3. 加 Add File 必须每行 `+` 前缀的强调
+///   4. 加 "If Update repeatedly fails, fall back to Delete + Add File" 兜底
+const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE: &str = concat!(
+    "[apply_patch chat-path guidance — injected by codex-app-transfer adapter because the upstream lark grammar constraint is unavailable on chat function-call providers]\n",
+    "When you call the `apply_patch` tool, follow these rules empirically observed with non-OpenAI chat providers:\n",
+    "\n",
+    "1. PREFERRED Update File form is MINIMAL: just `-line` (the row to remove, byte-exact) and `+line` (the new row) directly after `*** Update File: <path>` — NO `@@`, NO context lines. ",
+    "Use this whenever the `-` line is unique in the file (true for most simple single-line edits, config changes, function signatures, etc.). Example:\n",
+    "  *** Update File: src/config.py\n",
+    "  -DEBUG = False\n",
+    "  +DEBUG = True\n",
+    "If the `-` line alone is ambiguous (same line text in multiple places), add space-prefixed context lines (` line`) above/below to pin it down. ",
+    "Only if context lines are also insufficient, add a SINGLE-SIDED `@@ <header>` marker on its own row (`@@ class Foo`, `@@ def bar():`, `@@ fn main() {`). ",
+    "**NEVER add a trailing `@@`** (`@@ <header> @@` is wrong) — Codex Desktop's V4A applier treats trailing `@@` as literal text and fails with `Failed to find context '... @@'`. ",
+    "For deeply nested disambiguation use MULTIPLE `@@` lines on separate rows (e.g. `@@ class Outer\\n@@ def inner():`), each single-sided.\n",
+    "\n",
+    "2. Add File uses NO `@@` markers and NO hunks. After `*** Add File: <path>`, prefix EVERY line of the new file's content with `+`, including blank lines (write them as a bare `+` on its own row). Raw source code without `+` prefix (e.g. `def main():` directly) causes `'def main():' is not a valid hunk header` errors.\n",
+    "\n",
+    "3. Every `-` line and space-prefixed context line MUST match the file byte-for-byte (same leading whitespace, no trimmed trailing spaces, exact characters). If unsure, run `cat <path>` or `sed -n '1,80p' <path>` via shell first, then compose the patch from real bytes. Guessing produces `Failed to find context '<your guess>'` errors.\n",
+    "\n",
+    "3a. Line prefix is a SINGLE character with NO space between prefix and content: write `-DEBUG = False` (not `- DEBUG = False`), `+DEBUG = True` (not `+ DEBUG = True`), and ` keepme` (single leading space, for unchanged context). Codex Desktop V4A applier may tolerate a stray space, but other apply_patch implementations are strict — keep the prefix tight.\n",
+    "\n",
+    "4. Do NOT combine `*** Add File: <path>` and `*** Update File: <path>` for the same path in a single patch. The Update step reads the file before the Add step lands on disk, so it sees an empty file and fails. Either: (a) make `*** Add File:` write the final content in one shot, or (b) split into two separate `apply_patch` invocations.\n",
+    "\n",
+    "5. `*** Update File:` cannot operate on a totally empty file. If the target is empty, first use shell (e.g. `printf '\\n' > <path>`) to write at least one line, then call `apply_patch`.\n",
+    "\n",
+    "6. In a multi-line file, lone `+` lines without a corresponding `-` line APPEND below the previous context — they do NOT replace any existing line. To change an existing line, you MUST include BOTH a `-` line (removing the old content) AND a `+` line (adding the new content).\n",
+    "\n",
+    "7. If repeated Update File attempts on the same target fail with `Failed to find context` errors, fall back to a Delete File + Add File pair within the same patch (semantically equivalent to a full rewrite, avoids anchor-matching fragility).\n",
+    "\n",
+    "Following these rules avoids retry storms and improves the success rate on first attempt."
+);
+
+/// 检测 Responses request body 的 tools 数组是否注册了 `apply_patch` 工具。
+/// `apply_patch` 在 Responses 协议里以 `type:"custom", name:"apply_patch"` 出现,
+/// 在被 [`convert_responses_tool_to_chat_tool`] 降级前。
+/// 用于决定本 turn 是否注入 [`APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE`]。
+fn tools_register_apply_patch(body: &Value) -> bool {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return false;
+    };
+    tools.iter().any(|t| {
+        t.get("name").and_then(Value::as_str) == Some(APPLY_PATCH_TOOL_NAME)
+            && t.get("type").and_then(Value::as_str) == Some("custom")
+    })
+}
+
+fn apply_patch_chat_guidance_message() -> Value {
+    json!({
+        "role": "system",
+        "content": APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE,
+    })
+}

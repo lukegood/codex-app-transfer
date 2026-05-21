@@ -3,6 +3,160 @@ use serde_json::{json, Value};
 
 use super::provider_looks_like;
 
+/// Codex freeform tool name we special-case. See the `"custom" =>` arm in
+/// `convert_responses_tool_to_chat_tool` below for the request-side rewrite
+/// rationale, and `converter.rs::close_tool_call` for the response-side
+/// wire re-shape — they must trigger on the exact same tool name.
+pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
+
+/// Chat-path replacement for Codex CLI's freeform `apply_patch` description.
+/// Original upstream text says "do not wrap the patch in JSON" because the
+/// Responses API freeform/lark grammar accepts raw text — but on the
+/// chat-completions path the model MUST emit a function call whose `input`
+/// argument is a JSON string containing the V4A patch. We rewrite the
+/// description so the model sees instructions consistent with the wire
+/// format it has to produce.
+///
+/// **重要:hunk body 的 space-prefixed 行语义** — 上游 freeform 工具用 lark
+/// grammar 强制约束,模型在受约束的解码空间里不会搞错;但 chat function-call
+/// 没有 grammar 约束,只剩 description。实测(issue #235 真机)DeepSeek
+/// 反复在一个具体语义上栽跟头:
+///
+/// > `@@ <context> @@` 标记后的 space-prefixed 行 = 文件中 context 锚点
+/// > **之后**的行,**不是** context 行本身的重复
+///
+/// 不显式说清这个,模型会把 context 行当成 space 行再写一次,parse_patch
+/// 找不到双行 → 整个 patch 拒收。本 description 通过显式规则 + 一个最小
+/// 可执行的更新文件 example 让模型看到正确形态。
+pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
+    "Edit files using the apply_patch tool. ",
+    "Call this function with a single `input` string containing a V4A patch. ",
+    "The patch must start with `*** Begin Patch` and end with `*** End Patch`. ",
+    "Each file operation header is one of `*** Add File: <path>`, ",
+    "`*** Update File: <path>` (optionally followed by `*** Move to: <path>`), ",
+    "or `*** Delete File: <path>`. ",
+    "Within Update hunks, the simplest form is just `-`/`+` lines with no `@@` and ",
+    "no context (suitable when the `-` line is unique in the file). If disambiguation ",
+    "is needed, add space-prefixed context lines, or a single-sided `@@ <header>` ",
+    "marker (e.g. `@@ class Foo`, `@@ def bar():`) — NEVER add a trailing `@@`. ",
+    "Lines are `-line` (removed, no space after `-`), `+line` (added, no space after `+`), ",
+    "or ` line` (single leading space = unchanged context). ",
+    "Use relative paths only (never absolute). ",
+    "Embed real newlines as `\\n` inside the JSON string value for `input`.\n\n",
+    "CRITICAL `@@` ANCHOR SYNTAX (the most common cause of patch rejection on chat-completions providers):\n",
+    "The V4A `@@` operator is SINGLE-SIDED: write `@@ <header>` where `<header>` ",
+    "names the class/function/section the hunk belongs to (e.g. `@@ class MyClass`, ",
+    "`@@ def my_function():`, `@@ fn main() {`). ",
+    "**NEVER write a trailing `@@` (e.g. `@@ def f(): @@`)** — Codex Desktop's V4A ",
+    "applier will treat the trailing `@@` as literal text inside the anchor and ",
+    "fail with `Failed to find context '... @@'`. ",
+    "The `@@` header is OPTIONAL: if 3 lines of surrounding context already uniquely ",
+    "identify the location, omit the `@@` line entirely. ",
+    "If a single `@@ <header>` is ambiguous (same name appears in multiple classes), ",
+    "use MULTIPLE `@@` lines on separate rows (e.g. `@@ class Outer\\n@@ def inner():`) ",
+    "to narrow down — each line is one `@@ <header>`, single-sided.\n\n",
+    "ADD FILE FORMAT (different from Update — no hunks, no `@@`):\n",
+    "After `*** Add File: <path>`, **every line of the new file's content MUST be ",
+    "prefixed with `+`**, including blank lines (write them as a bare `+` on its own ",
+    "row). Do NOT use `@@` markers, hunks, or space-prefixed context lines in an ",
+    "Add File block — they are reserved for Update File. Writing raw source code ",
+    "(e.g. `def main():` with no `+` prefix) directly after `*** Add File:` causes ",
+    "`'def main():' is not a valid hunk header` errors.\n\n",
+    "LINE PREFIX FORMAT (zero whitespace between prefix and content):\n",
+    "Every line in a hunk starts with exactly ONE character followed by content with ",
+    "NO intervening space — `-line_content` (NOT `- line_content`), `+line_content` ",
+    "(NOT `+ line_content`), ` line_content` (single leading space = unchanged context). ",
+    "Codex Desktop V4A applier may tolerate a stray space, but other apply_patch ",
+    "implementations are strict — keep the prefix tight.\n\n",
+    "EXAMPLE 1 (MINIMAL UPDATE — preferred form for simple single-line edits): ",
+    "When the `-` line you remove is byte-exact and unique in the file, you may omit ",
+    "BOTH `@@` markers AND context lines — just write `-` and `+` lines directly:\n",
+    "*** Begin Patch\n",
+    "*** Update File: src/config.py\n",
+    "-DEBUG = False\n",
+    "+DEBUG = True\n",
+    "*** End Patch\n",
+    "This is the simplest and most reliable mode on chat-completions providers. Use ",
+    "it whenever the `-` line is unique enough to pinpoint the change location.\n\n",
+    "EXAMPLE 2 — Update with `@@` header (only when needed: same name in multiple ",
+    "classes/functions, or you want to disambiguate which occurrence to change):\n",
+    "*** Begin Patch\n",
+    "*** Update File: src/main.rs\n",
+    "@@ fn main() {\n",
+    "-    let x = 1;\n",
+    "+    let x = 2;\n",
+    "     println!(\"{}\", x);\n",
+    "*** End Patch\n",
+    "Notice: `@@ fn main() {` is single-sided (no trailing `@@`). The `-` line ",
+    "is byte-exact what currently appears in the file. The space-prefixed line is ",
+    "kept as-is for context. Use this form when `let x = 1;` appears in multiple ",
+    "functions and you need to specify which one.\n\n",
+    "EXAMPLE 3 — create a brand new file (Add File, no `@@`, every line `+`):\n",
+    "*** Begin Patch\n",
+    "*** Add File: hello.py\n",
+    "+def greet(name: str) -> str:\n",
+    "+    return f\"Hello, {name}!\"\n",
+    "+\n",
+    "+if __name__ == \"__main__\":\n",
+    "+    print(greet(\"world\"))\n",
+    "*** End Patch\n",
+    "Notice: no `@@`, every line has `+` (including the blank line as a bare `+`).\n\n",
+    "EXAMPLE 4 — update a function body with context lines (no `@@`, use when the ",
+    "`-` line is not unique enough by itself but a few surrounding lines pin it):\n",
+    "*** Begin Patch\n",
+    "*** Update File: src/util.py\n",
+    " def divide(a, b):\n",
+    "     \"\"\"Divide two numbers.\"\"\"\n",
+    "-    return a / b\n",
+    "+    if b == 0:\n",
+    "+        raise ValueError(\"divide by zero\")\n",
+    "+    return a / b\n",
+    "*** End Patch\n",
+    "Notice: 2 lines of space-prefixed context above the `-` line uniquely identify ",
+    "where to apply. Use this when minimal form (EXAMPLE 1) is ambiguous but `@@` ",
+    "(EXAMPLE 2) is overkill.\n\n",
+    "BYTE-EXACT MATCHING (#1 cause of `Failed to find context` on this path):\n",
+    "Every `-` line and every space-prefixed context line MUST match the file ",
+    "byte-for-byte — same leading whitespace, no trimmed trailing spaces, exact ",
+    "characters. If unsure, run `cat <path>` or `sed -n '1,80p' <path>` via shell ",
+    "to read it first, then compose the patch from real bytes. Guessing or ",
+    "paraphrasing produces `Failed to find context '<your guess>'` errors.\n\n",
+    "CHAT-PATH GOTCHAS (the lark grammar is gone here; observed empirically with non-OpenAI providers):\n",
+    "1. Use the SINGLE-SIDED `@@ <header>` form. The double-sided `@@ ... @@` form ",
+    "is NOT V4A — the trailing `@@` becomes literal text and breaks context matching.\n",
+    "2. Do NOT combine `*** Add File: foo` and `*** Update File: foo` in the SAME patch — Update reads the file before Add lands on disk. ",
+    "Either make Add File write the final content in one shot, or split into two separate patches.\n",
+    "3. `*** Update File:` cannot operate on a completely empty file. Use shell to write at least one line first, then apply_patch.\n",
+    "4. In a multi-line file, lone `+` lines without a corresponding `-` APPEND below the previous context — they do NOT replace any existing line. ",
+    "To change a line, use `-` to remove the old line AND `+` to add the new one; do not omit the `-`.\n",
+    "5. If multiple Update attempts on the same file fail with `Failed to find context` errors, fall back to a Delete File + Add File pair within the same patch (semantically equivalent to a full rewrite) — this avoids anchor-matching fragility."
+);
+
+/// Chat-path replacement for the freeform `input` parameter description.
+/// Mirrors `APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT` but at the parameter level,
+/// so the model sees the format constraint regardless of whether providers
+/// surface tool-level or parameter-level descriptions more prominently.
+/// Same anchor-vs-space-line gotcha called out here in compact form (some
+/// providers truncate or de-emphasize tool-level descriptions on long
+/// histories — keep the rule visible at parameter level too).
+pub(crate) const APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT: &str = concat!(
+    "A V4A patch starting with `*** Begin Patch` and ending with `*** End Patch`. ",
+    "Use `*** Add File:`, `*** Update File:`, or `*** Delete File:` headers. ",
+    "Update File simplest form: just `-line`/`+line` rows directly after the header ",
+    "(no `@@`, no context) — use this when the `-` line is unique in the file. ",
+    "If ambiguous, add space-prefixed context ` line` lines around the change, or ",
+    "single-sided `@@ <header>` (e.g. `@@ def func():`, NO trailing `@@`). ",
+    "Writing `@@ <header> @@` (double-sided) fails with `Failed to find context '... @@'`. ",
+    "Lines are `-text`/`+text`/` text` (single char prefix, NO space between prefix and content). ",
+    "Add File uses NO `@@` and NO hunks — prefix EVERY new content line with `+` ",
+    "(blank lines as bare `+`). Relative paths only. ",
+    "`-` lines and space-prefixed context MUST be byte-exact to the file's current content ",
+    "(read via `cat <path>` first if unsure) — guessing produces `Failed to find context` errors. ",
+    "Chat-path gotchas: do not Add+Update the same path in one patch; Update cannot ",
+    "operate on a totally empty file; lone `+` without `-` appends instead of replacing. ",
+    "If Update fails repeatedly, fall back to Delete File + Add File in one patch."
+);
+
 /// Responses tool 定义 → Chat tool 定义.
 /// 把单个 Responses API tool 转成零或多个 Chat Completions tool。
 ///
@@ -53,23 +207,51 @@ pub fn convert_responses_tool_to_chat_tool(
             })]
         }
         "custom" => {
-            // Custom tool(无 JSON schema)降级为接受单字符串 input 的 function
+            // Custom tool(Responses API freeform tool,无 JSON schema)降级为
+            // 接受单字符串 input 的 function tool — chat completions 不认
+            // `type:"custom"`,DeepSeek / Kimi / MiMo 等 chat 上游必须走 function。
+            //
+            // **apply_patch 特判**:Codex CLI 把 apply_patch 作为 freeform 工具
+            // 注册,wire description 是 "Use the `apply_patch` tool to edit files.
+            // This is a FREEFORM tool, so do not wrap the patch in JSON."
+            // (上游 `codex-rs/core/src/tools/handlers/apply_patch_spec.rs` 实证)。
+            // 经 chat function-call 反而**必须**把 patch 包进 JSON 字符串值 ——
+            // 上游的 "do not wrap in JSON" 指令在 chat 路径下会误导模型,
+            // 且原 description 没给 V4A 格式样例。这里替换成对 chat 路径准确
+            // 的指引,把 V4A 关键字 / 文件操作头 / hunk 标记列清楚,让 DeepSeek
+            // 之类的模型知道 input 字段该填什么。
+            // 响应侧(converter.rs::close_tool_call)对 name==apply_patch 特判,
+            // 把模型回来的 function_call 重新打包成 custom_tool_call wire,
+            // 让 Codex CLI router (`ResponseItem::CustomToolCall`) 正确路由到
+            // apply_patch handler(handler 硬要求 `ToolPayload::Custom { input }`,
+            // 见 `codex-rs/core/src/tools/handlers/apply_patch.rs:324`)。
             let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let description = obj
+            let original_description = obj
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let (tool_description, input_description) = if name == APPLY_PATCH_TOOL_NAME {
+                (
+                    APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT.to_owned(),
+                    APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT.to_owned(),
+                )
+            } else {
+                (
+                    original_description.to_owned(),
+                    "Free-form input passed verbatim to the tool.".to_owned(),
+                )
+            };
             vec![json!({
                 "type": "function",
                 "function": {
                     "name": name,
-                    "description": description,
+                    "description": tool_description,
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "input": {
                                 "type": "string",
-                                "description": "Free-form input passed verbatim to the tool.",
+                                "description": input_description,
                             }
                         },
                         "required": ["input"],
