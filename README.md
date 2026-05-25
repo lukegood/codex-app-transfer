@@ -93,7 +93,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | Provider | 多轮历史 | autocompact | tool_call_repair | 备注 |
 |---|---|---|---|---|
 | Kimi(Moonshot Platform / Kimi For Coding) | ✅ | ✅ | ✅ | thinking 三层防御 |
-| DeepSeek V4(含 Max 思维) | ✅ | ✅ | ✅ | 视觉输入剥离避免 400 |
+| DeepSeek V4(含 Max 思维) | ✅ | ✅ | ✅ | 视觉输入剥离避免 400;xhigh → max 真实到达(#254) |
 | Xiaomi MiMo(Token Plan / Pay for Token) | ✅ | ✅ | ✅ | 纯图请求兜底空格 text part |
 | MiniMax M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` 转 user 防 400(v2.1.6) |
 | Google AI Studio(`gemini_native`) | ✅ | ✅ | ✅ | Gemini 3 `/v1alpha` + Gemini 2.x `/v1beta` 自动选 |
@@ -104,6 +104,16 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | 智谱 GLM(5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
 | 阿里云百炼(Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
 | Responses 协议透传(custom) | — | — | — | 直连上游不经代理(适合 OpenAI 官方 / 原生 Responses 反代);⚠️ Plugins/MCP `namespace` 工具包不展平,部分上游会静默丢工具 |
+
+## 思考程度档位映射(chat 协议 `reasoning_effort`)
+
+Codex 的 `low/medium/high/xhigh` 在各 chat-completions 上游的处理方式(issue #254):
+
+| Provider | `xhigh` / `max` | 其他档位 | 备注 |
+|---|---|---|---|
+| **DeepSeek V4** | `reasoning_effort: "max"` | `low/medium/high` → `"high"` | 唯一接受 max 档的 chat 上游 |
+| **Kimi / Kimi Code / GLM / 阿里云百炼 / Xiaomi MiMo / MiniMax** | 不传字段 | 不传字段 | 上游不认 `reasoning_effort`,用自家默认 thinking;如需控制在 `requestOptions` 写 provider-native 字段 |
+| **自定义 chat-compat** | clamp 到 `"high"` | 同名透传 | OpenAI 标准 enum 保守 fallback |
 
 ## 模型映射
 
@@ -182,7 +192,9 @@ Kimi / DeepSeek 开启 thinking 后强制要求历史中带 tool_call 的 assist
 
 ### 上游 400:`'reasoning_effort' does not support 'xhigh'`
 
-Codex 用户配置里若把 `model_reasoning_effort` 设成 `xhigh` / `max`,本工具自动降级到 `high`。`auto` / `none` 等 Chat 端不接受的值会被丢弃。
+v2.1.14 及之前会把 `xhigh` / `max` 一刀切降级到 `high`(issue #254)。**v2.1.15+ 改为 per-provider 策略** — DeepSeek 真实 xhigh→max 到达;Kimi / GLM / MiMo / MiniMax / Qwen 不发该字段(上游不认);自定义保守 clamp。完整映射见上方 [思考程度档位映射](#思考程度档位映射reasoning_effort--上游)。
+
+`auto` / `none` / `disabled` 等 Chat 端不接受的值始终丢弃。
 
 ### MiniMax 400:`invalid message role: system (2013)`
 
@@ -238,7 +250,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 
 - [`farion1231/cc-switch`](https://github.com/farion1231/cc-switch) — provider 切换形态启发
 - [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x 桌面壳骨架 + README 结构参考
-- [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — 协议双向转换思路
+- [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — 协议双向转换思路;per-provider `get_supported_openai_params` 白名单作为 reasoning_effort 入表证据交叉验证(DeepSeek / Kimi / GLM / MiniMax / Qwen / MiMo)
 - [`tauri-apps/tauri`](https://tauri.app/) — v2 + `cas://` 架构基座
 - [`openai/codex`](https://github.com/openai/codex) — autocompact prompt 骨架 + compact 协议结构反查
 - [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact prompt 锚定 bullet

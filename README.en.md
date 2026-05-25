@@ -94,7 +94,7 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 | Provider | Multi-turn | autocompact | tool_call_repair | Notes |
 |---|---|---|---|---|
 | Kimi (Moonshot Platform / Kimi For Coding) | ✅ | ✅ | ✅ | Thinking 3-layer defense |
-| DeepSeek V4 (incl. Max thinking) | ✅ | ✅ | ✅ | Vision input stripped to avoid 400 |
+| DeepSeek V4 (incl. Max thinking) | ✅ | ✅ | ✅ | Vision input stripped to avoid 400; xhigh → real max effort (#254) |
 | Xiaomi MiMo (Token Plan / Pay for Token) | ✅ | ✅ | ✅ | Image-only requests get space text-part fallback |
 | MiniMax M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` → user (v2.1.6 fix for 400) |
 | Google AI Studio (`gemini_native`) | ✅ | ✅ | ✅ | Auto-selects Gemini 3 `/v1alpha` + Gemini 2.x `/v1beta` |
@@ -105,6 +105,16 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 | Zhipu GLM (5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy |
 | Alibaba Cloud Bailian (Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy |
 | Responses passthrough (custom) | — | — | — | Direct upstream connection, bypasses proxy (suitable for OpenAI official / native Responses reverse proxy); ⚠️ Plugins/MCP `namespace` tool bundle is NOT flattened — some upstreams silently drop tools |
+
+## Reasoning effort mapping (chat-compat `reasoning_effort`)
+
+How Codex's `low/medium/high/xhigh` is dispatched per chat-completions upstream (issue #254):
+
+| Provider | `xhigh` / `max` | Other tiers | Notes |
+|---|---|---|---|
+| **DeepSeek V4** | `reasoning_effort: "max"` | `low/medium/high` → `"high"` | Only chat upstream that accepts a true max tier |
+| **Kimi / Kimi Code / GLM / Bailian Qwen / Xiaomi MiMo / MiniMax** | field dropped | field dropped | Upstreams don't accept `reasoning_effort`; default thinking applies. Set provider-native fields in `requestOptions` to control explicitly |
+| **Custom chat-compat** | clamp to `"high"` | passthrough | OpenAI standard enum conservative fallback |
 
 ## Model mapping
 
@@ -183,7 +193,9 @@ Kimi / DeepSeek with thinking enabled require historical assistant messages with
 
 ### Upstream 400: `'reasoning_effort' does not support 'xhigh'`
 
-If Codex user config sets `model_reasoning_effort` to `xhigh` / `max`, this tool auto-degrades to `high`. `auto` / `none` etc. (which the Chat endpoint doesn't accept) are dropped.
+v2.1.14 and earlier clamped `xhigh` / `max` to `high` for all providers (issue #254). **v2.1.15+ uses a per-provider policy** — DeepSeek truly reaches max; Kimi / GLM / MiMo / MiniMax / Qwen drop the field (upstream doesn't accept it); custom proxies clamp conservatively. See the [reasoning effort mapping table](#reasoning-effort-mapping-chat-compat-reasoning_effort) above for the full matrix.
+
+`auto` / `none` / `disabled` and similar values that Chat endpoints do not accept are always dropped.
 
 ### MiniMax 400: `invalid message role: system (2013)`
 
@@ -239,7 +251,7 @@ Some experimental providers (Grok Web / Gemini CLI OAuth / Antigravity OAuth) in
 
 - [`farion1231/cc-switch`](https://github.com/farion1231/cc-switch) — provider switching paradigm inspiration
 - [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x desktop shell skeleton + README structure reference
-- [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — bidirectional protocol translation patterns
+- [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — bidirectional protocol translation patterns; per-provider `get_supported_openai_params` whitelists used as cross-validation evidence for `reasoning_effort` policy (DeepSeek / Kimi / GLM / MiniMax / Qwen / MiMo)
 - [`tauri-apps/tauri`](https://tauri.app/) — v2 + `cas://` architecture base
 - [`openai/codex`](https://github.com/openai/codex) — autocompact prompt base structure + compact protocol reverse-reference
 - [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact anchor bullets
