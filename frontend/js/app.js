@@ -69,12 +69,22 @@
     hideModal = true,
   } = {}) {
     const button = $(`#${buttonId}`);
-    const original = button?.textContent;
+    // MOC-20 / PR #281 fix:三种按钮形态都要兼容,不能直接改 button.textContent 否则抹 DOM:
+    //   a) modal 内纯文本按钮(#restartReminderNow):textContent 含 label,直接改安全
+    //   b) 含 icon + label span 按钮(dashboard quick-actions 形态):必须改 [data-i18n] 子节点
+    //   c) icon-only 按钮(header `.theme-btn`):textContent = 空白,只能改 disabled + .is-loading class
+    // 判断:有 [data-i18n] 子 → label swap;无子但 button.textContent.trim() 非空 → 改 button text;
+    // 都不是 → icon-only,仅 disabled + class 反馈。
+    const labelEl = button?.querySelector("[data-i18n]");
+    const buttonHasText = button && !labelEl && button.textContent.trim().length > 0;
+    const swapEl = labelEl || (buttonHasText ? button : null);
+    const original = swapEl?.textContent;
     try {
       if (button) {
         button.disabled = true;
-        button.textContent = t("restartReminder.restarting") || "重启中…";
+        button.classList.add("is-loading");
       }
+      if (swapEl) swapEl.textContent = t("restartReminder.restarting") || "重启中…";
       await CCApi.restartCodexApp();
       if (hideModal) restartReminderModal?.hide();
       showToast(t("toast.codexAppRestartRequested"));
@@ -84,8 +94,9 @@
     } finally {
       if (button) {
         button.disabled = false;
-        button.textContent = original || t(fallbackLabelKey);
+        button.classList.remove("is-loading");
       }
+      if (swapEl) swapEl.textContent = original || t(fallbackLabelKey);
     }
   }
 
@@ -2668,7 +2679,8 @@
       } else {
         showToast(t("toast.defaultUpdatedDesktop"));
       }
-      showRestartReminder();
+      // MOC-20:启用解耦 — 不再强制弹 restart-reminder modal,toast 文案已提示
+      // 用户去首页 quick-actions『重启 Codex』按钮手动重启(避免误点丢上下文)。
 
       if (desktopSync.requiresProxy) {
         CCApi.startProxy().catch((error) => {
@@ -2701,15 +2713,25 @@
         await renderProviders();
         await renderDashboard();
         const desktopSync = result.desktopSync || {};
+        // MOC-20:启用解耦 — 不再强制弹 restart-reminder modal,改用 toast +
+        // 让用户去首页『重启 Codex』按钮手动重启。
         if (desktopSync.attempted && desktopSync.success) {
           showToast(t("toast.defaultUpdatedDesktop"));
-          showRestartReminder();
         } else if (desktopSync.attempted && desktopSync.success === false) {
           showToast(t("toast.defaultUpdatedDesktopFailed"));
         } else {
           showToast(t("toast.defaultUpdated"));
-          showRestartReminder();
         }
+      }
+
+      if (action === "restart-codex-dashboard") {
+        // MOC-20:首页 quick-actions『重启 Codex』按钮 — 复用 restartCodexAppNow,
+        // 传 dashboard 按钮 id,hideModal=false(无 modal 可隐),按 dashboard 文案 fallback。
+        await restartCodexAppNow({
+          buttonId: "dashboardRestartCodexBtn",
+          fallbackLabelKey: "dashboard.restartCodex",
+          hideModal: false,
+        });
       }
 
       if (action === "new-from-preset") {
