@@ -43,6 +43,18 @@ With any provider enabled, Codex App's model picker shows `<provider> / <real-mo
 
 ![Codex App real conversation](img/codex-cli-real-chat.png)
 
+### Codex Desktop background themes (optional)
+
+Inject background image + frosted-glass panel CSS into Codex Desktop (the Electron client). Five built-in anime themes plus user upload. The Codex binary is not modified — runtime injection via Chromium DevTools Protocol; turn the toggle off on the Theme page to restore the native UI.
+
+| Changli | Azur Lane |
+|---|---|
+| ![Changli](img/codex-theme/codex-theme-changli.jpg) | ![Azur Lane](img/codex-theme/codex-theme-azurlane.jpg) |
+| **Nailin** | **Zani** |
+| ![Nailin](img/codex-theme/codex-theme-nailin.jpg) | ![Zani](img/codex-theme/codex-theme-zani.jpg) |
+
+A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts to the cursor. **Custom backgrounds**: Theme page → "+ Add custom" → pick a JPG/PNG → 1:1 crop modal (drag + scroll to zoom) → apply. If the toggle is on at Codex launch, the selected theme auto-injects — no manual step needed.
+
 ## What it does
 
 - Manage multiple providers; map OpenAI model names (`gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` / `gpt-5.2`) to the provider's real model IDs
@@ -60,6 +72,7 @@ With any provider enabled, Codex App's model picker shows `<provider> / <real-mo
 - Feedback dialog automatically attaches diagnostic material (environment info, sanitized config, recent error snapshot with full request / response) — fewer back-and-forth follow-ups
 - Chinese / English UI; light / dark / green / orange / gray / white themes
 - **Injected system prompts follow the UI language**: the `apply_patch` chat-path rules + autocompact summarization prompt that this project injects for non-OpenAI providers track the `语言 / Language` setting (Chinese users → Chinese prompts, avoiding mixed-language model thinking); V4A keywords (`*** Begin Patch` / `@@ <header>` etc.) + Codex CLI error message originals stay in English (parser / matcher does not accept translations)
+- **Codex Desktop Theme (optional, off by default)**: Theme page ships 5 built-in anime themes (`carton` with a floating mascot + `changli` / `azurlane` / `nailin` / `zani` background-only), injects CSS token overrides + background image into Codex Desktop via CDP. Toggle is independent from Plugin Unlock; page reload re-applies automatically
 - Cross-platform single-instance lock (double-click brings the existing window forward) + cross-process file lock prevents multi-instance config-write lost-updates
 - Windows / macOS / Linux system tray
 

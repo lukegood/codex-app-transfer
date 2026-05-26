@@ -36,6 +36,7 @@
         <a href="#proxy" class="route-tab" data-nav="proxy" title="Forwarding"><i class="bi bi-broadcast-pin"></i><span data-i18n="nav.proxy">转发</span></a>
         <a href="#settings" class="route-tab" data-nav="settings" title="Settings"><i class="bi bi-gear"></i><span data-i18n="nav.settings">设置</span></a>
         <a href="#codex" class="route-tab" data-nav="codex" title="Codex 资产"><i class="bi bi-bookmark"></i><span data-i18n="nav.codex">Codex 资产</span></a>
+        <a href="#theme" class="route-tab" data-nav="theme" title="Theme"><i class="bi bi-palette"></i><span data-i18n="nav.theme">主题</span></a>
         <a href="#guide" class="route-tab" data-nav="guide" title="Guide"><i class="bi bi-book"></i><span data-i18n="nav.guide">引导</span></a>
       </nav>
       <div class="header-actions">
@@ -804,6 +805,21 @@
             </div>
           </div>
         </div>
+      </section>
+
+      <section class="page" id="page-theme" data-page="theme">
+        <div style="display:flex;align-items:center;gap:12px;justify-content:flex-end;">
+          <span id="themeHiddenBadge" style="display:none;font-size:12px;color:var(--bs-secondary-color);"></span>
+          <button class="btn btn-link btn-sm p-0" type="button" id="themeRestoreHidden" style="display:none;font-size:12px;"><span data-i18n="theme.restoreHidden">恢复隐藏</span></button>
+          <label class="switch-label only-switch"><input type="checkbox" id="codexUiThemeEnabled"><span class="switch-ui"></span></label>
+          <button class="btn btn-outline-danger btn-sm" type="button" data-action="theme-restart-codex" title="完全 quit + 重启 Codex.app"><i class="bi bi-power"></i><span data-i18n="theme.restartCodexBtn">Restart Codex</span></button>
+        </div>
+
+        <div id="themeListContainer" style="margin-top:14px;">
+          <!-- renderTheme() 动态填充 5 个主题卡 -->
+        </div>
+
+        <span id="themeStatusBadge" class="settings-note" style="display:block;margin-top:10px;"></span>
       </section>
 
       <section class="page" id="page-guide" data-page="guide">

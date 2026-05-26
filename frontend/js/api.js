@@ -511,13 +511,16 @@
       return api('GET', '/api/antigravity-oauth/models');
     },
   };
-})();
 
 // ── Codex Desktop Plugins 解锁 API ──
+// **#264 fix**: pluginUnlock + theme 必须留在 IIFE **内**(line 1 `(function () {`),
+// 否则 IIFE close 后 `api()` fn 不可见,调用报 `Can't find variable: api`。
+// 原版 line 514 的 `})()` 提前关 IIFE 是 bug(plugin unlock UI 实际很少触发,
+// 没暴露);改成 IIFE 包到文件末尾。
 
-window.CCAPI = window.CCAPI || {};
+window.CCApi = window.CCApi || {};
 
-window.CCAPI.pluginUnlock = {
+window.CCApi.pluginUnlock = {
   /** 查询解锁状态 */
   async status() {
     return api('GET', '/api/desktop/plugin-unlock/status');
@@ -538,3 +541,45 @@ window.CCAPI.pluginUnlock = {
     return api('POST', '/api/desktop/plugin-unlock/reinject');
   },
 };
+
+window.CCApi.theme = {
+  /** 列出内置主题(#264) */
+  async list() {
+    return api('GET', '/api/desktop/theme/list');
+  },
+  /** 当前注入状态 */
+  async status() {
+    return api('GET', '/api/desktop/theme/status');
+  },
+  /** 应用指定主题 */
+  async apply(themeId) {
+    return api('POST', '/api/desktop/theme/apply', { theme_id: themeId });
+  },
+  /** 清除主题(回原生 Codex UI) */
+  async clear() {
+    return api('POST', '/api/desktop/theme/clear');
+  },
+  /** 刷新 Codex Desktop 当前 page。v1 无前端调用(主题切换 IIFE 即刻生效不需 reload);
+   *  保留对应后端 endpoint 做开发 / 测试备用 */
+  async reload() {
+    return api('POST', '/api/desktop/theme/reload');
+  },
+  /** 重启 Codex.app(quit + 启动)— 复用 desktop handler */
+  async restartCodex() {
+    return api('POST', '/api/desktop/restart-codex-app');
+  },
+  /** 上传 / 替换自定义主题图。流程:前端 `openCropModal` 让 user 拖选 1:1
+   *  区域 → canvas 已 crop 成方形 JPEG → 后端再 center-crop(已是方图时 no-op)
+   *  + resize 2048 + JPEG encode 写 `~/.codex-app-transfer/themes/custom/`。
+   *  `dataUri` 形如 `data:image/jpeg;base64,...` */
+  async uploadCustom(dataUri) {
+    return api('POST', '/api/desktop/theme/custom/upload', { data_uri: dataUri });
+  },
+  /** 删除自定义主题(rm disk) */
+  async deleteCustom() {
+    return api('DELETE', '/api/desktop/theme/custom');
+  },
+};
+
+})();
+
