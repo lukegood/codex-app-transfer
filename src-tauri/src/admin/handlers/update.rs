@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use axum::{extract::Query, http::StatusCode, response::IntoResponse, Json};
@@ -14,6 +15,50 @@ use sha2::{Digest, Sha256};
 use super::super::registry_io::load as load_registry;
 use super::super::signature::verify_signed_bytes;
 use super::common::{err, APP_VERSION};
+
+/// Shared reqwest client for update checks (cached to avoid repeated build overhead
+/// and potential system-proxy auto-detection hangs on Windows).
+///
+/// 只 cache 成功的 Client(`OnceLock<reqwest::Client>`),不 cache Err — 之前
+/// `OnceLock<Result<_, String>>` 设计在冷启动 `Client::builder().build()` 失败
+/// 时(rustls 配置冲突 / Windows system-proxy 解析失败等极端 case)会把 Err
+/// 永久 cache,后续每次调用都返同样 string,用户需重启进程才能恢复。改成
+/// 失败时仅记 `tracing::error!` 并返 Err,下次调用会重新尝试 build。
+fn shared_update_check_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(c) = CLIENT.get() {
+        return Ok(c);
+    }
+    let c = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| {
+            tracing::error!(error = %e, "[update] check client init failed");
+            format!("update check client init failed: {e}")
+        })?;
+    Ok(CLIENT.get_or_init(|| c))
+}
+
+/// Shared reqwest client for update install (large file download).
+/// 同 [`shared_update_check_client`] 的不 cache Err 语义。
+fn shared_update_install_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(c) = CLIENT.get() {
+        return Ok(c);
+    }
+    let c = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| {
+            tracing::error!(error = %e, "[update] install client init failed");
+            format!("update install client init failed: {e}")
+        })?;
+    Ok(CLIENT.get_or_init(|| c))
+}
 
 pub(super) fn current_update_platform() -> String {
     current_update_platform_for(std::env::consts::OS, std::env::consts::ARCH)
@@ -731,23 +776,26 @@ pub async fn update_check(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
         .filter(|v| !v.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(current_update_platform);
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                format!("update URL request failed: {e}"),
-            )
-            .into_response()
-        }
+    let client = match shared_update_check_client() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
-    match check_update_impl(&client, &update_url, &current, &platform).await {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
+    // outer 15s = inner 10s reqwest timeout + 5s grace,防 reqwest 0.12 内部
+    // timer 在 DNS / TLS 握手卡死场景偶发不触发(reqwest issue tracker 已知)。
+    // 调整 inner timeout 必须保持小于 15s,否则 outer 永远先 fire。
+    match tokio::time::timeout(
+        Duration::from_secs(15),
+        check_update_impl(&client, &update_url, &current, &platform),
+    )
+    .await
+    {
+        Ok(Ok(result)) => Json(result).into_response(),
+        Ok(Err(e)) => err(StatusCode::BAD_REQUEST, e).into_response(),
+        Err(_) => err(
+            StatusCode::BAD_REQUEST,
+            "update check timed out, please try again",
+        )
+        .into_response(),
     }
 }
 
@@ -782,25 +830,28 @@ pub async fn update_install(body: Option<Json<UpdateInstallInput>>) -> impl Into
         .filter(|v| !v.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(current_update_platform);
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
+    let client = match shared_update_install_client() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    // outer 310s = inner 300s reqwest timeout + 10s grace,跟 update_check 的
+    // 双层 timeout 一致(同 DNS/TLS hang 风险,reqwest 内部 timer 偶发不触发)。
+    let mut result = match tokio::time::timeout(
+        Duration::from_secs(310),
+        download_update_impl(&client, &update_url, &current, &platform, None),
+    )
+    .await
     {
-        Ok(client) => client,
-        Err(e) => {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+        Err(_) => {
             return err(
                 StatusCode::BAD_REQUEST,
-                format!("update URL request failed: {e}"),
+                "update download timed out, please try again",
             )
             .into_response()
         }
     };
-    let mut result =
-        match download_update_impl(&client, &update_url, &current, &platform, None).await {
-            Ok(result) => result,
-            Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
-        };
     if result.get("updateAvailable").and_then(|v| v.as_bool()) != Some(true) {
         return Json(result).into_response();
     }
