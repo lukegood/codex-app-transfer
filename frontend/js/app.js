@@ -2627,6 +2627,12 @@
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
     $("#mcpCredentialsPortableStore").checked = settings.mcpCredentialsPortableStore !== false;
     $("#codexNetworkAccess").checked = settings.codexNetworkAccess !== false;
+    // [MOC-169] 诊断模式开关 + 「打开查看器」按钮(仅开启时可见)
+    if ($("#traceViewerEnabled")) {
+      const _tv = settings.traceViewerEnabled === true;
+      $("#traceViewerEnabled").checked = _tv;
+      if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = !_tv;
+    }
     if ($("#webFetchBackend")) {
       const _wfb = settings.webFetchBackend || "off";
       // segmented 按钮组: 高亮当前档 + 记下"已保存值"供切换失败/取消时回退。
@@ -3177,6 +3183,7 @@
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
       mcpCredentialsPortableStore: $("#mcpCredentialsPortableStore")?.checked !== false,
       codexNetworkAccess: $("#codexNetworkAccess")?.checked !== false,
+      traceViewerEnabled: $("#traceViewerEnabled")?.checked === true,
       webFetchBackend: $("#webFetchBackend")?.querySelector(".btn.active")?.dataset.webfetch || "off",
       codexStatusSectionDefaultVisible: $("#codexStatusSectionDefaultVisible")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
@@ -3792,6 +3799,16 @@
           showToast(t("toast.logDirOpened"));
         } catch (err) {
           showToast(t("toast.logDirOpenFailed"));
+        }
+      }
+
+      // [MOC-169] 在系统浏览器打开诊断流量查看器(未运行则后端先 start)
+      if (action === "open-trace-viewer") {
+        try {
+          const r = await CCApi.openTraceViewer();
+          if (r && r.success === false) showToast("打开诊断查看器失败");
+        } catch (_) {
+          showToast("打开诊断查看器失败");
         }
       }
 
@@ -8470,6 +8487,49 @@
     });
     $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
     $("#codexNetworkAccess")?.addEventListener("change", saveSettingsFromForm);
+    // [MOC-169] 诊断模式开关:持久化 + 运行时起/停查看器服务 + 切按钮可见性。
+    // 注意:api() 对后端返回的 `success:false`(含 bind 失败)会 **throw**(api.js:28),
+    // 所以启动失败走 catch —— 回滚必须放 catch 里(后端 start 失败已同步清运行时 gate)。
+    $("#traceViewerEnabled")?.addEventListener("change", async () => {
+      const on = $("#traceViewerEnabled")?.checked === true;
+      if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = !on;
+      // [MOC-169] 存设置失败**不应**阻止下面起/停——尤其关时必须停掉采集(安全语义:用户关了
+      // 就不能继续抓)。save 失败只 log,继续走 start/stop。
+      try {
+        await saveSettingsFromForm();
+      } catch (e) {
+        console.warn("[trace-viewer] save settings failed, proceeding with start/stop", e);
+      }
+      // [MOC-169] 快速 on→off 竞争:若 await 期间用户又 toggle 了(当前 checkbox 状态已与本次
+      // 捕获的 on 不符),本次是 stale handler → 放弃 start/stop,交给最新那次 change 处理。
+      // 否则 stale 的 on handler 可能在 off 之后又 start,留 viewer 开但开关显示关
+      // (后端 start_lock 排不了序,因为前端在 save 之后才发 /start)。
+      if (($("#traceViewerEnabled")?.checked === true) !== on) return;
+      try {
+        if (on) {
+          const r = await CCApi.traceViewerStart();
+          showToast(r?.url ? `诊断查看器已启动 ${r.url}` : "诊断查看器已启动");
+        } else {
+          await CCApi.traceViewerStop();
+          showToast("诊断查看器已关闭");
+        }
+      } catch (e) {
+        if (on) {
+          // 启动失败(如 18090 被占):回滚开关 + 隐藏按钮 + 回滚持久化,避免 UI 假"on"
+          // 且 traceViewerEnabled 持久化为 true 导致重启反复重试。
+          $("#traceViewerEnabled").checked = false;
+          if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = true;
+          try {
+            await saveSettingsFromForm();
+          } catch (_) {
+            /* 回滚持久化失败也不再抛:UI 已复位为 off,后端 start 已清 gate */
+          }
+          showToast("诊断查看器启动失败" + (e && e.message ? `:${e.message}` : ""));
+        } else {
+          showToast("诊断查看器关闭失败");
+        }
+      }
+    });
     // MOC-144 联网抓取后端: segmented 按钮组(不用原生 <select>, 避免下拉 popup 遮挡下方文字)。
     // 回退目标 = #webFetchBackend.dataset.saved("上次成功保存值", load + 每次成功 save 后更新);
     // _webFetchSwitching 作 in-flight guard, 防 20s 下载期间重复点触发并发。

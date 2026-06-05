@@ -11,6 +11,7 @@ mod mcp_webfetch_server;
 mod proxy_runner;
 mod system_proxy;
 mod telemetry_bridge;
+mod trace_viewer;
 #[cfg(target_os = "windows")]
 mod windows_msix;
 
@@ -42,8 +43,11 @@ fn main() {
     telemetry_bridge::init_global_subscriber();
 
     let proxy_manager = Arc::new(ProxyManager::new());
+    // [MOC-169] 诊断流量查看器:独立端口 SSE 服务,默认关,gate 开时随 app 自启(见 setup)。
+    let trace_viewer_manager = Arc::new(trace_viewer::TraceViewerManager::new());
     let admin_state = AdminState {
         proxy_manager: proxy_manager.clone(),
+        trace_viewer_manager: trace_viewer_manager.clone(),
     };
     let app_router = Arc::new(build_app_router(admin_state));
     let app_router_for_protocol = app_router.clone();
@@ -64,6 +68,7 @@ fn main() {
             }
         }))
         .manage(proxy_manager)
+        .manage(trace_viewer_manager)
         .register_asynchronous_uri_scheme_protocol("cas", move |_app, request, responder| {
             let router = app_router_for_protocol.clone();
             tauri::async_runtime::spawn(async move {
@@ -78,9 +83,35 @@ fn main() {
             // #262:加载 `settings.language` 一次,同步到 adapters 全局,确保
             // startup 后第一个 user 请求的 prompt 注入就是正确语言。后续 user
             // 切语言由 `save_settings` 内的 hot reload(同模块 fn)处理。
+            let mut trace_viewer_persisted = false;
             if let Ok(cfg) = handlers::settings::load_registry_for_startup_language_sync() {
                 let settings = cfg.get("settings").cloned().unwrap_or_else(|| serde_json::json!({}));
                 handlers::settings::sync_user_language_from_settings(&settings);
+                trace_viewer_persisted = settings
+                    .get("traceViewerEnabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            }
+
+            // [MOC-169] 诊断流量查看器:env `CAS_DIAG_TRACE` 或持久化「诊断模式」开关任一开
+            // 时随 app 自启。默认关 → 不启、零开销。运行时采集 gate 由 `vm.start`/`stop_silent`
+            // 在 start_lock 内与 viewer 生命周期原子绑定(成功才开 gate、失败不开 → 无残留),
+            // 这里不再单独动 gate。env `CAS_DIAG_TRACE` 项在 forward_trace_enabled() 里恒真、独立。
+            if codex_app_transfer_proxy::diagnostics::forward_trace_enabled() || trace_viewer_persisted
+            {
+                let vm = app
+                    .state::<Arc<trace_viewer::TraceViewerManager>>()
+                    .inner()
+                    .clone();
+                match vm.start(trace_viewer::DEFAULT_TRACE_VIEWER_PORT) {
+                    Ok(addr) => codex_app_transfer_proxy::proxy_telemetry().logs.add(
+                        "INFO",
+                        format!("[trace-viewer] 诊断流量查看器已启动 http://{addr}"),
+                    ),
+                    Err(e) => codex_app_transfer_proxy::proxy_telemetry()
+                        .logs
+                        .add("WARN", format!("[trace-viewer] 启动失败: {e}")),
+                }
             }
 
             // Deep link scheme handler:codex-app-transfer://v1/import?...
@@ -395,6 +426,24 @@ fn main() {
         if matches!(event, RunEvent::Exit) {
             let manager = app_handle.state::<Arc<ProxyManager>>();
             manager.stop_silent();
+            // gate 状态要在 stop_silent 清除前读(用于决定是否需停 Codex 页内 recorder)。
+            let diag_was_on = codex_app_transfer_proxy::diagnostics::forward_trace_enabled();
+            app_handle
+                .state::<Arc<trace_viewer::TraceViewerManager>>()
+                .stop_silent();
+            // [MOC-169] 诊断开着退出:优雅停 plugin-unlock daemon,让它退出前 best-effort 停掉
+            // Codex 页内 MCP recorder(Codex 仍开时 recorder 否则留在渲染进程继续抓流量到下次
+            // reload)。stop 发 Stop 命令后短暂等 daemon 处理(发停采 eval + 退出);bounded
+            // timeout 防退出 hang;daemon 没在跑(relay/未启)时 stop 直接返回、无副作用。
+            if diag_was_on {
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_millis(600), async {
+                        handlers::plugin_unlock::get_service().await.stop().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    })
+                    .await
+                });
+            }
             // 取消任何 in-flight OAuth login —— 防 user 在 OAuth 5min 等待
             // 期间 Cmd+Q 退出 app,后台 task 残留 5min 后才超时(浪费资源,
             // 而且 callback 还可能触发 token persist 写入磁盘但 user 已经
@@ -495,6 +544,8 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
         "quit" => {
             let manager = app.state::<Arc<ProxyManager>>();
             manager.stop_silent();
+            app.state::<Arc<trace_viewer::TraceViewerManager>>()
+                .stop_silent();
             app.exit(0);
         }
         _ => {}

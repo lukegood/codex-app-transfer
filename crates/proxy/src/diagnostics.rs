@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -151,18 +151,29 @@ fn bytes_payload_with_len(bytes: &[u8], true_len: usize, max_bytes: usize) -> Va
 // ⚠️ 定位:这是**开发者诊断**,不是「脱敏后可安全外泄」的功能。forward-trace 的价值
 // 就在抓完整 prompt / 代码 / 模型回复,这些**本身敏感且不脱敏**(脱了无诊断价值)。
 // 下面的脱敏只挡**结构化 credential**(header token / JSON 里的 api_key 等),正文照留。
-// 所以它默认关 + 仅 loopback + 仅本地,绝不随 release 给终端用户开。见 docs/forward-trace.md。
+// 所以它默认关 + 仅 loopback + 仅本地,绝不随 release 给终端用户开。见 README「协议转发诊断」节。
 // ───────────────────────────────────────────────────────────────────────────
 
-/// forward-trace 开关。默认**关**(普通用户零影响)。仅 env `CAS_DIAG_TRACE=1`(或
-/// `true`)开启;首次读取后缓存,后续每请求仅一次 `OnceLock` load、零额外开销。
+/// 运行时开关(app 内「诊断模式」UI toggle / 持久化 settings 自启时置位),与 env 并联。
+static RUNTIME_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// forward-trace / MCP-trace 总开关。默认**关**(普通用户零影响)。两条启用路径**并联**:
+/// ① env `CAS_DIAG_TRACE=1`/`true`(首读缓存,zero-overhead);② 运行时 [`set_forward_trace_enabled`]
+/// (app 内「诊断模式」开关 / 启动时按持久化 settings 置位)。任一为真即开。关时转发热路径
+/// 仅一次 `OnceLock` load + 一次 atomic load。
 pub fn forward_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
+    static ENV_ENABLED: OnceLock<bool> = OnceLock::new();
+    let env_on = *ENV_ENABLED.get_or_init(|| {
         std::env::var("CAS_DIAG_TRACE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
-    })
+    });
+    env_on || RUNTIME_TRACE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 运行时开/关诊断采集(app 内 toggle 用)。env 开启的不受影响(env 恒为真)。
+pub fn set_forward_trace_enabled(on: bool) {
+    RUNTIME_TRACE_ENABLED.store(on, Ordering::Relaxed);
 }
 
 /// forward 全过程 trace 入参(全引用,write 内才序列化)。成功路径由 forward.rs 的
@@ -345,6 +356,139 @@ fn is_credential_key(key: &str) -> bool {
         || norm.ends_with("apikey")
 }
 
+/// 脱敏一条 MCP-trace 记录(整个 JSON 对象,MOC-169 增量 4)。
+/// ① 递归按 [`is_credential_key`] 清洗所有 credential 键(覆盖 authorization/api_key/*_token 等);
+/// ② `req_headers`/`resp_headers` 额外按**宽 header 白名单**清洗 narrow 漏的(`cookie`/`session`/
+/// `proxy-authorization` 等会话凭据头);③ body 类字符串字段(`body`/`req_body`/`resp_body`/`data`)
+/// 若是 JSON 则解析后键级清洗,**否则按 form-urlencoded 清洗**(覆盖 oauth token 端点的
+/// `client_secret`/`refresh_token` 等 `application/x-www-form-urlencoded` 请求体)。
+/// **非 JSON / 非 form / 被页内截断的 body 不解析**(同 forward-trace 取舍)—— MCP 采集默认关 +
+/// 仅 loopback + 仅本地,勿外传(见 README「协议转发诊断」节)。
+pub fn redact_mcp_value(v: &mut Value) {
+    redact_json_credentials(v);
+    if let Some(obj) = v.as_object_mut() {
+        // ② headers 宽匹配补漏(narrow 的 redact_json_credentials 已处理 authorization/api_key/*_token)
+        for hk in ["req_headers", "resp_headers"] {
+            if let Some(Value::Object(hdrs)) = obj.get_mut(hk) {
+                for (name, val) in hdrs.iter_mut() {
+                    if is_wide_extra_credential_header(name) {
+                        *val = Value::String("***".to_string());
+                    }
+                }
+            }
+        }
+        // ③ body:JSON → 键级清洗;否则 form-urlencoded → 键级清洗
+        for key in ["body", "req_body", "resp_body", "data"] {
+            let scrubbed = match obj.get(key) {
+                Some(Value::String(s)) => redact_body_string(s),
+                _ => None,
+            };
+            if let Some(scrubbed) = scrubbed {
+                obj.insert(key.to_string(), Value::String(scrubbed));
+            }
+        }
+        // ④ URL 的 credential(query ?code=/?access_token=、Google ?key=、OAuth implicit #access_token=、
+        //    SPA hash-route #/cb?code= 等),含 fragment 与嵌套 query
+        if let Some(Value::String(u)) = obj.get("url") {
+            let (red, changed) = redact_credential_params(u);
+            if changed {
+                obj.insert("url".to_string(), Value::String(red));
+            }
+        }
+    }
+}
+
+/// 把 `k=v` 串里 credential 键的值清洗成 `***`,用于 URL(query/fragment)与 form-urlencoded
+/// body。按 `?` / `&` / `#` **统一切段**(保留分隔符),故能处理 `path?query#fragment`、SPA
+/// hash-route `#/route?access_token=…`(fragment 里还有嵌套 `?query`)、`#access_token=…`(OAuth
+/// implicit)、form body `k=v&k=v` 等各种嵌套;非 `k=v` 段(scheme/host/path)原样保留。
+/// 值里的 `=`(如 base64 padding)不切,不破坏 value。返回(脱敏后串, 是否有改动)。
+/// 判定见 [`is_credential_query_param`]。
+fn redact_credential_params(s: &str) -> (String, bool) {
+    let mut out = String::with_capacity(s.len());
+    let mut changed = false;
+    let mut seg_start = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if b == b'?' || b == b'&' || b == b'#' {
+            push_redacted_param(&s[seg_start..i], &mut out, &mut changed);
+            out.push(b as char);
+            seg_start = i + 1;
+        }
+    }
+    push_redacted_param(&s[seg_start..], &mut out, &mut changed);
+    (out, changed)
+}
+
+/// 一个 `?`/`&`/`#`-分隔段:若是 `name=value` 且 name 是 credential → `name=***`,否则原样。
+fn push_redacted_param(seg: &str, out: &mut String, changed: &mut bool) {
+    if let Some((k, _v)) = seg.split_once('=') {
+        if is_credential_query_param(k) {
+            out.push_str(k);
+            out.push_str("=***");
+            *changed = true;
+            return;
+        }
+    }
+    out.push_str(seg);
+}
+
+/// URL query 参数名是否承载 credential。比 [`is_credential_key`] 多覆盖 URL 特有的 OAuth /
+/// API-key 参数:`code`(授权码)/ `code_verifier`(PKCE)/ `key`(Google `?key=<api_key>`)/
+/// `sid` / `session*`。诊断里宁可过度脱敏也不漏 token。
+fn is_credential_query_param(name: &str) -> bool {
+    if is_credential_key(name) {
+        return true;
+    }
+    let norm: String = name
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    matches!(norm.as_str(), "code" | "codeverifier" | "key" | "sid") || norm.contains("session")
+}
+
+/// MCP header 名是否属于 [`is_credential_key`] **没覆盖**的会话凭据类(cookie / session /
+/// proxy-authorization)。注:`cookie`/`set-cookie` 是浏览器 forbidden header、JS 抓不到,
+/// 这里覆盖主要是 `x-session-*` / `proxy-authorization` 这类 JS 可设可读的自定义凭据头。
+fn is_wide_extra_credential_header(name: &str) -> bool {
+    let norm: String = name
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    norm.contains("cookie") || norm.contains("session") || norm == "proxyauthorization"
+}
+
+/// 脱敏一个 body 字符串:① 完整 JSON → 键级清洗;② form-urlencoded(`k=v&k=v`)→ credential
+/// 键值清洗;③ **看似 JSON 但解析失败**(被页内 recorder `truncate` 截断 / 残缺)→ 无法安全
+/// 脱敏 + 前缀可能含 credential → **正文省略**(codex-connector P2:截断的 JSON 原样落盘会漏前
+/// 64KB 里的 token);④ 纯文本(SSE 等,无结构化 credential)→ 返 `None` 原样保留。
+fn redact_body_string(s: &str) -> Option<String> {
+    // ① 完整 JSON
+    if let Ok(mut parsed) = serde_json::from_str::<Value>(s) {
+        redact_json_credentials(&mut parsed);
+        return Some(serde_json::to_string(&parsed).unwrap_or_else(|_| "***".to_string()));
+    }
+    let trimmed = s.trim_start();
+    // ② form-urlencoded:含 `=`、不以 `{`/`[` 开头(排除残缺 JSON)。即便被截断也能逐对清洗。
+    // 复用 redact_credential_params(同 URL),覆盖 code/code_verifier/client_secret 等。
+    if s.contains('=') && !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        let (out, touched) = redact_credential_params(s);
+        if touched {
+            return Some(out);
+        }
+    }
+    // ③ 看似 JSON 却解析失败(截断/残缺),或带页内截断标记 → 无法解析脱敏,正文省略防泄露
+    if trimmed.starts_with('{') || trimmed.starts_with('[') || s.contains("<truncated ") {
+        return Some(format!(
+            "<diagnostic: unparseable/truncated structured body omitted to avoid credential leak ({} bytes)>",
+            s.len()
+        ));
+    }
+    // ④ 纯文本(SSE / 非结构化)→ 原样保留
+    None
+}
+
 fn header_content_type(h: &reqwest::header::HeaderMap) -> Option<&str> {
     h.get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -401,8 +545,8 @@ pub(crate) fn build_forward_trace_value(input: &ForwardTraceInput, seq: u64) -> 
 /// 调用方须先用 [`forward_trace_enabled`] gate。返回 jsonl 路径(写盘失败 / 无 home 返
 /// `None`)供调用方判定「开了诊断却写不出」。ring/broadcast 是 best-effort,不影响返回值。
 pub fn write_forward_trace_jsonl(input: &ForwardTraceInput) -> Option<PathBuf> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    // 与 MCP-trace 共用全局单调 seq(viewer 行主键全局唯一)。
+    let seq = crate::trace_store::next_seq();
     let value = build_forward_trace_value(input, seq);
     crate::trace_store::trace_store().push(crate::trace_store::TraceKind::Forward, seq, value)
 }
@@ -443,6 +587,132 @@ pub(crate) fn trim_old_files(dir: &Path, keep: usize, ext: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_mcp_value_cleanses_headers_and_oauth_body() {
+        // 模拟一条 MCP/oauth fetch 记录:headers 带 authorization,resp_body 是 oauth token JSON
+        let mut v = json!({
+            "kind": "fetch",
+            "url": "https://auth.example.com/oauth/token",
+            "req_headers": {"authorization": "Bearer SECRET", "content-type": "application/json"},
+            "resp_body": "{\"access_token\":\"at-LEAK\",\"refresh_token\":\"rt-LEAK\",\"expires_in\":3600}",
+            "max_tokens": 8
+        });
+        redact_mcp_value(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        // header credential 脱敏
+        assert_eq!(v["req_headers"]["authorization"], "***");
+        assert_eq!(
+            v["req_headers"]["content-type"], "application/json",
+            "协议头保留"
+        );
+        // body 里的 oauth token 脱敏(JSON 解析后 key 清洗)
+        assert!(!s.contains("at-LEAK"), "access_token 泄露: {s}");
+        assert!(!s.contains("rt-LEAK"), "refresh_token 泄露");
+        // 诊断字段不误伤
+        assert_eq!(v["max_tokens"], 8);
+        assert_eq!(v["url"], "https://auth.example.com/oauth/token");
+    }
+
+    #[test]
+    fn redact_mcp_value_cleanses_form_urlencoded_body_and_session_headers() {
+        let mut v = json!({
+            "kind": "fetch",
+            "url": "https://auth.example.com/token",
+            "req_headers": {
+                "x-session-id": "sess-LEAK",
+                "proxy-authorization": "Basic LEAK",
+                "content-type": "application/x-www-form-urlencoded"
+            },
+            "req_body": "grant_type=refresh_token&refresh_token=rt-LEAK&client_secret=cs-LEAK&scope=read"
+        });
+        redact_mcp_value(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        // 宽 header 白名单补漏(narrow is_credential_key 没覆盖的会话凭据头)
+        assert_eq!(v["req_headers"]["x-session-id"], "***", "session 头未脱敏");
+        assert_eq!(
+            v["req_headers"]["proxy-authorization"], "***",
+            "proxy-authorization 未脱敏"
+        );
+        assert_eq!(
+            v["req_headers"]["content-type"],
+            "application/x-www-form-urlencoded"
+        );
+        // form-urlencoded body 的 credential 值脱敏,非 credential 字段保留
+        assert!(!s.contains("rt-LEAK"), "form refresh_token 泄露: {s}");
+        assert!(!s.contains("cs-LEAK"), "form client_secret 泄露");
+        let body = v["req_body"].as_str().unwrap();
+        assert!(
+            body.contains("grant_type=refresh_token"),
+            "非 credential 字段应保留"
+        );
+        assert!(body.contains("scope=read"));
+    }
+
+    #[test]
+    fn redact_mcp_value_redacts_url_query_credentials() {
+        let mut v = json!({
+            "kind": "fetch",
+            "url": "https://auth.example.com/callback?code=AUTH-LEAK&access_token=AT-LEAK&key=GKEY-LEAK&state=xyz&page=2"
+        });
+        redact_mcp_value(&mut v);
+        let u = v["url"].as_str().unwrap();
+        assert!(!u.contains("AUTH-LEAK"), "oauth code 泄露: {u}");
+        assert!(!u.contains("AT-LEAK"), "access_token 泄露");
+        assert!(!u.contains("GKEY-LEAK"), "google ?key= 泄露");
+        // 非 credential 参数 + path 保留
+        assert!(u.contains("state=xyz"), "非 credential state 应保留");
+        assert!(u.contains("page=2"));
+        assert!(u.starts_with("https://auth.example.com/callback?"));
+        // 无 query 的 URL 原样
+        let mut v2 = json!({"kind":"fetch","url":"https://x.com/mcp"});
+        redact_mcp_value(&mut v2);
+        assert_eq!(v2["url"], "https://x.com/mcp");
+
+        // OAuth implicit flow:token 在 URL fragment(#access_token=…)也要脱敏(codex-connector)
+        let mut v3 = json!({"kind":"ws_open","url":"https://app/cb?state=ok#access_token=FRAG-LEAK&token_type=Bearer&expires_in=3600"});
+        redact_mcp_value(&mut v3);
+        let u3 = v3["url"].as_str().unwrap();
+        assert!(
+            !u3.contains("FRAG-LEAK"),
+            "fragment access_token 泄露: {u3}"
+        );
+        assert!(
+            u3.contains("token_type=Bearer"),
+            "非 credential fragment 参数保留"
+        );
+        assert!(u3.contains("state=ok"), "query 段保留");
+        assert!(u3.contains('#'), "fragment 分隔符保留");
+
+        // SPA hash-route:fragment 里还有嵌套 ?query(#/callback?code=…&access_token=…)
+        let mut v4 = json!({"kind":"fetch","url":"https://app/#/oauth/callback?code=HASH-LEAK&access_token=HA-LEAK&tab=1"});
+        redact_mcp_value(&mut v4);
+        let u4 = v4["url"].as_str().unwrap();
+        assert!(!u4.contains("HASH-LEAK"), "hash-route code 泄露: {u4}");
+        assert!(!u4.contains("HA-LEAK"), "hash-route access_token 泄露");
+        assert!(u4.contains("/oauth/callback"), "hash-route path 保留");
+        assert!(u4.contains("tab=1"), "非 credential 参数保留");
+    }
+
+    #[test]
+    fn redact_mcp_value_omits_truncated_json_body() {
+        // 页内 recorder 把超 64KB 的 JSON body 截断并加标记;到这里无法解析 → 正文省略防泄露
+        let mut v = json!({
+            "kind": "fetch",
+            "resp_body": "{\"access_token\":\"at-LEAK\",\"data\":\"xxxxxxxxxx...<truncated 99999 bytes>"
+        });
+        redact_mcp_value(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("at-LEAK"), "截断 JSON 的 token 泄露了: {s}");
+        assert!(
+            v["resp_body"].as_str().unwrap().contains("omitted"),
+            "截断 JSON 正文应省略"
+        );
+        // 纯文本(SSE)不受影响,原样保留
+        let mut sse = json!({"kind":"ws_recv","data":"event: ping\ndata: hello\n\n"});
+        redact_mcp_value(&mut sse);
+        assert_eq!(sse["data"], "event: ping\ndata: hello\n\n");
+    }
 
     #[test]
     fn bytes_payload_preserves_utf8_and_binary() {
