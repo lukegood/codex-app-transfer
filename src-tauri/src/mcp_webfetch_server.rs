@@ -1394,7 +1394,12 @@ fn web_fetch_tool_def() -> Value {
                 }
             },
             "required": ["url", "prompt"]
-        }
+        },
+        // MOC-172: readOnlyHint=true → Codex guardian 的 requires_mcp_tool_approval
+        // (core/src/mcp_tool_call.rs)命中 read_only_hint 直接返回「不需审批」,只读抓取工具
+        // 跳过 auto-review 审批往返、消除联网延迟;destructiveHint=false 确保不被强制审批
+        // (destructive=true 优先级最高会触发审批)。openWorldHint=true 如实声明访问开放网络。
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": true }
     })
 }
 
@@ -1421,7 +1426,9 @@ fn web_search_tool_def() -> Value {
                 }
             },
             "required": ["query"]
-        }
+        },
+        // MOC-172: 同 web_fetch —— 只读搜索工具,readOnlyHint 让 guardian 跳过审批。
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": true }
     })
 }
 
@@ -1569,6 +1576,9 @@ mod tests {
         assert_eq!(d["inputSchema"]["required"][1], "prompt");
         assert_eq!(d["inputSchema"]["properties"]["url"]["type"], "string");
         assert_eq!(d["inputSchema"]["properties"]["prompt"]["type"], "string");
+        // MOC-172: readOnlyHint=true / destructiveHint=false 让 guardian 跳过 auto-review 审批。
+        assert_eq!(d["annotations"]["readOnlyHint"], true);
+        assert_eq!(d["annotations"]["destructiveHint"], false);
     }
 
     #[test]
@@ -1581,6 +1591,9 @@ mod tests {
             d["inputSchema"]["properties"]["max_results"]["type"],
             "integer"
         );
+        // MOC-172: readOnlyHint=true / destructiveHint=false 让 guardian 跳过 auto-review 审批。
+        assert_eq!(d["annotations"]["readOnlyHint"], true);
+        assert_eq!(d["annotations"]["destructiveHint"], false);
     }
 
     #[test]
