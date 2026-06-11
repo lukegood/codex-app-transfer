@@ -51,52 +51,135 @@ pub const DEFAULT_MAX_RESULTS: usize = 15;
 /// 结果上限硬顶(防模型传超大值撑爆 context;MOC-190: 20→30)。
 const MAX_RESULTS_CAP: usize = 30;
 
-/// 搜索 `query`, 返回结构化结果列表。固定走 DDG html 版 + headless(见模块注释)。
+/// 每页结果基准条数(Bing first= 翻页步长 + DDG 单页约值)。
+const PAGE_SIZE: usize = 10;
+
+/// 页码(1-indexed)→ Bing `first=` 偏移:page 1→1, page 2→11, page 3→21(`first` 是 1-indexed 结果序号)。
+/// `page < 1` 视作 1。MOC-215: 抽成纯函数便于单测 —— 这是翻页的核心行为(此前仅 live test 覆盖)。
+fn bing_first_offset(page: usize) -> usize {
+    (page.max(1) - 1) * PAGE_SIZE + 1
+}
+
+/// 搜索 `query` 第 `page` 页, 返回结构化结果列表。固定走 headless(见模块注释)。
 ///
-/// `max_results` 截到 `[1, 30]`(`0` 视作 1, `>30` 截到 30)—— 防模型传超大值撑爆 context。
+/// - `max_results` 截到 `[1, 30]`(`0` 视作 1, `>30` 截到 30)—— 防模型传超大值撑爆 context。
+/// - `page` 1-indexed(`0` 视作 1)。**page 1**: DDG + Bing 并行 merge(覆盖最全);**page ≥ 2**:
+///   仅 Bing `first=` 深页 —— DDG html GET `s=` 实测**不翻页**(返回同页, 需 POST+vqd token),
+///   故深页交给 Bing(MOC-215 step2 分页机制 headless 实测)。让模型"再搜"取**新结果**而非重复。
 pub async fn web_search(
     query: &str,
     max_results: usize,
+    page: usize,
 ) -> Result<Vec<SearchResult>, WebSearchError> {
     let q = query.trim();
     if q.is_empty() {
         return Err(WebSearchError::NoResults);
     }
     let max = max_results.clamp(1, MAX_RESULTS_CAP);
-    let url = format!(
+    let page = page.max(1);
+    // MOC-215 step1+2: DDG + Bing **并行抓取后合并去重**(此前 Bing 仅在 DDG 0 结果时兜底)。两家
+    // 索引覆盖不同, 合并提升全面性;并行(非串行)故 wall-time ≈ max(单家)。翻页(step2):Bing GET
+    // `first=` 实测有效, DDG GET `s=` 实测不翻页 → DDG 仅 page 1 贡献、深页只 Bing。no_wait: DDG
+    // 202 anomaly 硬拦截不自动解(白等 15s), 靠 anomaly marker 自判 Blocked。任一家抓取失败非致命。
+    let want_ddg = page == 1;
+    let ddg_url = format!(
         "https://html.duckduckgo.com/html/?q={}",
         urlencoding::encode(q)
     );
-    // no_wait: DDG 的 202 anomaly 是硬拦截、不会自动解出, 不走 wait-for-clear(白等 15s); search
-    // 靠 anomaly marker 自己判 Blocked + 后备 Bing, 要拿到 anomaly 页 html(MOC-156 review)。
-    let html = crate::headless::fetch_rendered_html_no_wait(&url).await?;
-    let results = parse_ddg_html(&html, max);
-    if !results.is_empty() {
-        return Ok(results);
-    }
-    // DDG 0 结果 → 后备引擎 Bing (⑤ MOC-186): DDG 出口 IP 被风控 (anomaly) 时整个 search 单点
-    // 不可用; Bing 覆盖与 DDG 不同, 既治该单点、也补"DDG 索引无但 Bing 有"。spike 实测 headless 抓
-    // Bing 拿 10 条干净直链结果。Bing 抓取失败/空则落回按 DDG 信号收尾 (多花一次 headless, 仅在
-    // DDG 0 结果这一少数路径)。
-    let bing_url = format!("https://www.bing.com/search?q={}", urlencoding::encode(q));
-    match crate::headless::fetch_rendered_html_no_wait(&bing_url).await {
-        Ok(bing_html) => {
-            let bing = parse_bing_html(&bing_html, max);
-            if !bing.is_empty() {
-                return Ok(bing);
+    let bing_first = bing_first_offset(page);
+    let bing_url = format!(
+        "https://www.bing.com/search?q={}&first={}",
+        urlencoding::encode(q),
+        bing_first
+    );
+    let (ddg_fetch, bing_fetch) = tokio::join!(
+        async {
+            if want_ddg {
+                Some(crate::headless::fetch_rendered_html_no_wait(&ddg_url).await)
+            } else {
+                None // 深页 DDG GET 不翻页, 不抓(省一次 headless)
             }
+        },
+        crate::headless::fetch_rendered_html_no_wait(&bing_url),
+    );
+    let mut ddg_results = Vec::new();
+    let mut ddg_anomaly = false;
+    if let Some(ref ddg_r) = ddg_fetch {
+        match ddg_r {
+            // 各家先取到硬顶, 合并去重后再截 max(避免单家前 max 把另一家挤掉)。
+            Ok(html) => {
+                ddg_results = parse_ddg_html(html, MAX_RESULTS_CAP);
+                if ddg_results.is_empty() {
+                    ddg_anomaly = has_anomaly_markers(html);
+                }
+            }
+            Err(e) => eprintln!("[web_search] DDG 抓取失败: {e}"),
         }
-        // Bing 抓取失败(网络/Chrome): 留痕便于区分"Bing 也被拦"vs"Bing 没跑起来", 再落回 DDG 信号。
-        Err(e) => eprintln!("[web_search] Bing 后备抓取失败 (落回 DDG 信号): {e}"),
     }
-    // 两家都拿不到: 区分"反爬拦截"(DDG anomaly 页, 该退避重试)与"真无结果 / 结构变化"(该换查询)
-    // —— remediation 相反, 必须分开报(避免把 block 误报成 NoResults 让模型改查询而非退避;
-    // silent-failure-hunter MOC-12 review)。判定基于 DDG 页"无结果元素 + anomaly 文案"。
-    Err(if has_anomaly_markers(&html) {
-        WebSearchError::Blocked
-    } else {
-        WebSearchError::NoResults
-    })
+    let bing_results = match &bing_fetch {
+        Ok(html) => parse_bing_html(html, MAX_RESULTS_CAP),
+        Err(e) => {
+            eprintln!("[web_search] Bing 抓取失败: {e}");
+            Vec::new()
+        }
+    };
+    let merged = merge_dedup(ddg_results, bing_results, max);
+    if !merged.is_empty() {
+        return Ok(merged);
+    }
+    // 无合并结果, 区分三类(remediation 相反、必须分开报;silent-failure-hunter MOC-12 review):
+    // ① DDG anomaly 反爬页 → Blocked(该退避重试);
+    // ② Bing 抓取层失败(headless 崩溃/超时)→ 透传 Fetch 错 —— **不能把后端崩溃伪报成 NoResults**
+    //    让模型改 query 而非退避:DDG 即便成功返空, 我们也没拿到 Bing 的答案, 无权宣称"无结果"
+    //    (此前用 `!matches!(ddg_fetch, Some(Ok))` 守卫会在 DDG 成功-返空时吞掉 Bing 崩溃, 已修);
+    // ③ Bing 成功返空(无论 DDG 成功返空 or 抓取失败-已 stderr 记)→ NoResults(该换查询)。
+    if ddg_anomaly {
+        return Err(WebSearchError::Blocked);
+    }
+    if let Err(e) = bing_fetch {
+        return Err(WebSearchError::from(e));
+    }
+    Err(WebSearchError::NoResults)
+}
+
+/// 归一化 URL 做去重: 去尾斜杠 + 去 fragment + 小写(host 大小写不敏感;path 小写是务实过宽
+/// 匹配, 极少 case-sensitive path 碰撞、可接受)。**保留 query**(不同 query = 不同页, 不能并)。
+fn norm_url(u: &str) -> String {
+    let no_frag = u.trim().split('#').next().unwrap_or("");
+    no_frag.trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// 合并 DDG + Bing 结果: **轮流交错取**(DDG, Bing, DDG, Bing…), 按归一化 URL 去重, 截到 max。
+/// 交错而非拼接 → 两家各自靠前的高质结果都能进前列(单家排第 max+1 的不会被另一家前 max 挤掉),
+/// 覆盖面最大化。两家其一空(抓取失败/被拦)时退化为另一家结果。
+fn merge_dedup(ddg: Vec<SearchResult>, bing: Vec<SearchResult>, max: usize) -> Vec<SearchResult> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(max);
+    let mut a = ddg.into_iter();
+    let mut b = bing.into_iter();
+    let (mut a_done, mut b_done) = (false, false);
+    while out.len() < max && !(a_done && b_done) {
+        match a.next() {
+            Some(r) => {
+                if seen.insert(norm_url(&r.url)) {
+                    out.push(r);
+                }
+            }
+            None => a_done = true,
+        }
+        if out.len() >= max {
+            break;
+        }
+        match b.next() {
+            Some(r) => {
+                if seen.insert(norm_url(&r.url)) {
+                    out.push(r);
+                }
+            }
+            None => b_done = true,
+        }
+    }
+    out
 }
 
 /// DDG 反爬挑战页文案标记(仅在解析出 0 条结果时调用, 用于区分"被拦"与"真无结果")。
@@ -290,6 +373,80 @@ mod tests {
         assert_eq!(r[0].url, "https://openai.com/chatgpt/pricing");
     }
 
+    fn sr(url: &str) -> SearchResult {
+        SearchResult {
+            title: url.to_owned(),
+            url: url.to_owned(),
+            snippet: String::new(),
+        }
+    }
+
+    #[test]
+    fn merge_dedup_interleaves_and_dedupes() {
+        // ddg[0] 与 bing[0] 是同 URL(差尾斜杠)→ 去重;交错取剩余。
+        let ddg = vec![sr("https://a.com/"), sr("https://b.com")];
+        let bing = vec![sr("https://a.com"), sr("https://c.com")];
+        let m = merge_dedup(ddg, bing, 10);
+        let urls: Vec<&str> = m.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(m.len(), 3, "got {urls:?}");
+        // a.com 去重后只一条
+        assert_eq!(
+            m.iter()
+                .filter(|r| norm_url(&r.url) == "https://a.com")
+                .count(),
+            1
+        );
+        assert!(urls.contains(&"https://b.com"));
+        assert!(urls.contains(&"https://c.com"));
+    }
+
+    #[test]
+    fn merge_dedup_truncates_to_max_and_handles_empty_engine() {
+        let ddg = vec![sr("https://1"), sr("https://2"), sr("https://3")];
+        // Bing 空(抓取失败/被拦)→ 退化为 ddg, 截到 max=2。
+        let m = merge_dedup(ddg, vec![], 2);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].url, "https://1");
+        assert_eq!(m[1].url, "https://2");
+    }
+
+    #[test]
+    fn norm_url_strips_trailing_slash_and_fragment() {
+        assert_eq!(norm_url("https://X.com/Path/#sec"), "https://x.com/path");
+        assert_eq!(norm_url("https://x.com"), "https://x.com");
+        // query 保留(不同 query 不能并)
+        assert_eq!(norm_url("https://x.com/?q=1"), "https://x.com/?q=1");
+        // 前后空白先 trim(一家带空白的 URL 应与另一家干净的去重为一条)
+        assert_eq!(norm_url("  https://x.com/  "), "https://x.com");
+    }
+
+    #[test]
+    fn bing_first_offset_maps_page_to_offset() {
+        // 1-indexed page → Bing first= 偏移(PR 核心翻页行为)
+        assert_eq!(bing_first_offset(1), 1);
+        assert_eq!(bing_first_offset(2), 11);
+        assert_eq!(bing_first_offset(3), 21);
+        // page<1 视作 1(防 0/下溢)
+        assert_eq!(bing_first_offset(0), 1);
+    }
+
+    #[test]
+    fn merge_dedup_degrades_to_single_engine_and_drains_tail() {
+        // DDG 空(抓取失败)→ 退化为纯 Bing
+        let bing = vec![sr("https://b1"), sr("https://b2")];
+        let m = merge_dedup(vec![], bing, 10);
+        assert_eq!(
+            m.iter().map(|r| r.url.as_str()).collect::<Vec<_>>(),
+            ["https://b1", "https://b2"]
+        );
+        // DDG 先耗尽, Bing 还有尾巴 → 继续 drain Bing(不提前停)
+        let ddg = vec![sr("https://a1")];
+        let bing = vec![sr("https://b1"), sr("https://b2"), sr("https://b3")];
+        let m = merge_dedup(ddg, bing, 10);
+        assert_eq!(m.len(), 4); // a1 + b1 + b2 + b3, 无丢失
+        assert!(m.iter().any(|r| r.url == "https://b3"));
+    }
+
     #[test]
     fn decodes_uddg_and_passthrough() {
         assert_eq!(
@@ -382,7 +539,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "real network + headless Chrome"]
     async fn live_ddg_search() {
-        let r = web_search("openai chatgpt plus pricing", 5).await;
+        let r = web_search("openai chatgpt plus pricing", 5, 1).await;
         eprintln!("live web_search: {r:#?}");
         let results = r.expect("web_search should succeed on live network");
         assert!(!results.is_empty(), "expected >=1 result");

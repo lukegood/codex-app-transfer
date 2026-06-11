@@ -76,7 +76,8 @@ pub struct Settings {
     /// 内置联网抓取工具的后端档位 (MOC-144): `off`(不暴露抓取工具) / `curl`(reqwest
     /// 静态 GET) / `wreq`(浏览器 TLS 指纹, 绕 Cloudflare JS 挑战) / `headless`(headless
     /// Chromium 跑 JS, 取渲染后 DOM)。**独立于** [`Self::codex_network_access`](后者管
-    /// Codex 沙箱 shell 的联网权限, 是两套机制)。默认 `off`。
+    /// Codex 沙箱 shell 的联网权限, 是两套机制)。**默认 `auto`**(MOC-215:从 `off` 改,
+    /// 让内置联网工具开箱可用;web_search 仍受 chrome_ready gate 保护、不静默下载)。
     #[serde(default = "default_web_fetch_backend")]
     pub web_fetch_backend: String,
 
@@ -94,8 +95,19 @@ fn default_codex_network_access() -> bool {
     false
 }
 
+/// 内置联网抓取后端的默认档(MOC-215: off→auto,开箱即用)。**单一真源** —— typed serde 默认
+/// (本文件)与**所有读 raw JSON config 的 fallback**(src-tauri:current_backend / 启动 sync /
+/// save·import 比较)都引这个常量,防 drift。`auto` 安全:web_fetch 用 curl/wreq 不需 Chrome;
+/// web_search 仍受 mcp_webfetch_server 的 chrome_ready gate 保护,Chrome 未就绪时不暴露、不静默
+/// 下载 ~86MB。用户可在设置里改回 off。
+///
+/// **Why 提常量**(devin/codex bot review #445):此前只改了 typed serde 默认,raw 读取点仍 hardcode
+/// `"off"` → 老用户(config 缺该字段)UI 经 serde 显示 auto、但启动 sync 读 raw 退 off、不注册 MCP,
+/// 工具不激活,违背开箱即用。统一引常量根治。
+pub const DEFAULT_WEB_FETCH_BACKEND: &str = "auto";
+
 fn default_web_fetch_backend() -> String {
-    "off".to_owned()
+    DEFAULT_WEB_FETCH_BACKEND.to_owned()
 }
 
 impl Default for Settings {
