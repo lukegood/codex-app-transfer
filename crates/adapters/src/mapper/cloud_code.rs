@@ -38,6 +38,13 @@ impl CloudCodeApiFlavor {
     }
 }
 
+/// provider 的 `api_format` 是否是 antigravity 系(三个别名)。单一判定源,供 proxy
+/// (是否对响应流做 image_gen 履约拦截)与 gemini 请求侧(是否给模型暴露 image_gen 工具)
+/// 共用,避免两处各抄一份匹配列表日后漂移(MOC-210 code-review N-2)。
+pub fn is_antigravity_api_format(api_format: &str) -> bool {
+    CloudCodeApiFlavor::from_api_format(api_format).is_antigravity()
+}
+
 /// 按 provider `api_format` 选择 token 文件名。
 pub(crate) fn token_filename_for_api_format(api_format: &str) -> &'static str {
     if CloudCodeApiFlavor::from_api_format(api_format).is_antigravity() {
@@ -478,6 +485,148 @@ pub(crate) fn prepare_cloud_code_request(
         compact_v2: false,
         original_responses_request: Some(parsed),
     })
+}
+
+// ─────────────────── [MOC-210] antigravity 出图(image_gen 履约)───────────────────
+
+/// antigravity 默认图像后端模型。model id 含 "image" → `apply_antigravity_transform`
+/// 的 `is_image` 路径自动激活(requestType=image_gen)。可经 provider.models 的
+/// `gpt-image-1` / `gpt_image_1` / `image` 槽位覆盖。
+/// 真机实测 cloudcode-pa /v1internal 认 `gemini-3.1-flash-image`;language_server 里的
+/// `-preview` 后缀是 Vertex AI aiplatform 端点用的,cloudcode-pa 不认(404),故用无后缀版。
+const DEFAULT_ANTIGRAVITY_IMAGE_MODEL: &str = "gemini-3.1-flash-image";
+
+fn resolve_antigravity_image_model(provider: &Provider) -> String {
+    for key in ["gpt-image-1", "gpt_image_1", "image"] {
+        if let Some(v) = provider.models.get(key) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return t.to_owned();
+            }
+        }
+    }
+    DEFAULT_ANTIGRAVITY_IMAGE_MODEL.to_owned()
+}
+
+/// 构造 antigravity(cloud_code)出图请求体:`{prompt, n}` → gemini `generateContent`
+/// (prompt 进 user parts + `generationConfig.responseModalities:["IMAGE"]`),裹
+/// cloud_code envelope 并走 is_image 指纹路径(requestType=image_gen)。
+/// 被 `build_antigravity_image_gen_request`(proxy image_gen 履约子请求)复用 —— 后者把
+/// `upstream_path` 覆盖为流式 streamGenerateContent。入站 model 被 resolver 重写为文本
+/// 默认槽位,这里**忽略**它、改用图像模型。
+fn prepare_antigravity_image_request(
+    body: &[u8],
+    provider: &Provider,
+) -> Result<RequestPlan, AdapterError> {
+    let parsed: Value = serde_json::from_slice(body)?;
+    let prompt = parsed
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| AdapterError::BadRequest("images request missing prompt".into()))?;
+    let n = parsed
+        .get("n")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .clamp(1, 8);
+
+    let model = resolve_antigravity_image_model(provider);
+    let project_id = resolve_cloud_code_project_id(provider)?;
+    let flavor = CloudCodeApiFlavor::from_api_format(&provider.api_format);
+
+    let mut generation_config = serde_json::Map::new();
+    generation_config.insert("responseModalities".into(), json!(["IMAGE"]));
+    if n > 1 {
+        generation_config.insert("candidateCount".into(), json!(n));
+    }
+    let mut inner_value = json!({
+        "contents": [{ "role": "user", "parts": [{ "text": prompt }] }],
+        "generationConfig": Value::Object(generation_config),
+    });
+    apply_cloud_code_request_compat(&mut inner_value, flavor);
+
+    let outer = wrap_cloud_code_envelope(&model, &project_id, inner_value).map_err(|e| {
+        AdapterError::BadRequest(format!("OS RNG unavailable for user_prompt_id: {e}"))
+    })?;
+    let outer = apply_antigravity_transform(outer, &model).map_err(|e| {
+        AdapterError::BadRequest(format!("OS RNG unavailable for antigravity requestId: {e}"))
+    })?;
+    let outer_body = serde_json::to_vec(&outer).map_err(AdapterError::BodyDecode)?;
+
+    Ok(RequestPlan {
+        upstream_path: cloud_code_upstream_path(false), // build_antigravity_image_gen_request 会覆盖为流式
+        body: bytes::Bytes::from(outer_body),
+        upstream_headers: http::HeaderMap::new(),
+        response_session: None,
+        adapter_metadata: None,
+        is_compact: false,
+        compact_v2: false,
+        original_responses_request: None,
+    })
+}
+
+/// [MOC-210] 从 buffered cloud_code gemini SSE 响应里抽 `image_gen` functionCall 的
+/// prompt。模型调 image_gen 出图时 proxy 据此触发履约子请求。仅认 name=="image_gen"。
+pub fn extract_image_gen_prompt(buffered: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(buffered).ok()?;
+    for line in text.lines() {
+        let payload = line
+            .strip_prefix("data:")
+            .map(str::trim)
+            .unwrap_or_else(|| line.trim());
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        let root = v.get("response").unwrap_or(&v);
+        let Some(cands) = root.get("candidates").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for cand in cands {
+            let Some(parts) = cand.pointer("/content/parts").and_then(|p| p.as_array()) else {
+                continue;
+            };
+            for part in parts {
+                let Some(fc) = part
+                    .get("functionCall")
+                    .or_else(|| part.get("function_call"))
+                else {
+                    continue;
+                };
+                if fc.get("name").and_then(|n| n.as_str()) != Some("image_gen") {
+                    continue;
+                }
+                if let Some(prompt) = fc
+                    .pointer("/args/prompt")
+                    .and_then(|p| p.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    return Some(prompt.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// [MOC-210] 用 prompt 构造 antigravity 出图子请求(履约用)。复用 image gen envelope
+/// builder(非流式 generateContent → gemini 回 inlineData)。
+pub fn build_antigravity_image_gen_request(
+    prompt: &str,
+    provider: &Provider,
+) -> Result<RequestPlan, AdapterError> {
+    let body = serde_json::to_vec(&json!({ "model": "gpt-image-1", "prompt": prompt, "n": 1 }))
+        .map_err(AdapterError::BodyDecode)?;
+    let mut plan = prepare_antigravity_image_request(&body, provider)?;
+    // 履约子请求走**流式** streamGenerateContent → 响应是 SSE,交回主请求的 cloud_code
+    // 正常 SSE 转换器(unwrap envelope + gemini→responses + emit_inline_data),inlineData
+    // 转成 image_generation_call。`adapter_metadata.images_mode` 不带(那是 /v1/images
+    // 端点的非流 JSON 响应路径,履约不走它)。
+    plan.upstream_path = cloud_code_upstream_path(true);
+    plan.adapter_metadata = None;
+    Ok(plan)
 }
 
 /// cloud-code 响应流转换：
@@ -961,5 +1110,89 @@ mod tests {
             !req.contains_key("toolConfig"),
             "built-in 工具无 functionDeclarations 不应设 VALIDATED"
         );
+    }
+
+    // ───────────────── [MOC-210] antigravity 出图(image_gen 履约)─────────────────
+
+    fn antigravity_image_provider(models: Value) -> Provider {
+        serde_json::from_value(json!({
+            "id": "ag",
+            "name": "Antigravity",
+            "baseUrl": "https://cloudcode-pa.googleapis.com",
+            "apiFormat": "antigravity_oauth",
+            "cloud_code_project_id": "proj-test",
+            "models": models,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_image_model_defaults_then_honors_override() {
+        // 默认
+        let p = antigravity_image_provider(json!({ "default": "gemini-3-flash-agent" }));
+        assert_eq!(
+            resolve_antigravity_image_model(&p),
+            DEFAULT_ANTIGRAVITY_IMAGE_MODEL
+        );
+        // provider.models 覆盖
+        let p2 = antigravity_image_provider(json!({ "gpt-image-1": "gemini-3-pro-image" }));
+        assert_eq!(resolve_antigravity_image_model(&p2), "gemini-3-pro-image");
+    }
+
+    #[test]
+    fn prepare_image_request_builds_image_gen_envelope() {
+        let provider = antigravity_image_provider(json!({ "default": "gemini-3-flash-agent" }));
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt-image-1",
+            "prompt": "a cute orange tabby cat",
+            "n": 1,
+            "size": "1024x1024",
+            "quality": "high",
+        }))
+        .unwrap();
+
+        let plan = prepare_antigravity_image_request(&body, &provider).unwrap();
+
+        // 非流式 generateContent(履约入口 build_antigravity_image_gen_request 会覆盖为流式);
+        // 不带 adapter_metadata(端点专用的 images_mode 标记已随未启用端点删除)。
+        assert_eq!(plan.upstream_path, cloud_code_upstream_path(false));
+        assert!(plan.adapter_metadata.is_none());
+        assert!(!plan.is_compact);
+
+        let envelope: Value = serde_json::from_slice(&plan.body).unwrap();
+        // antigravity is_image 指纹
+        assert_eq!(
+            envelope.get("requestType").and_then(|v| v.as_str()),
+            Some("image_gen")
+        );
+        assert!(envelope
+            .get("requestId")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .starts_with("image_gen/"));
+        // 用图像模型(非入站 gpt-image-1、非文本默认)
+        assert_eq!(
+            envelope.get("model").and_then(|v| v.as_str()),
+            Some(DEFAULT_ANTIGRAVITY_IMAGE_MODEL)
+        );
+        // prompt → user parts + responseModalities
+        let req = envelope.get("request").unwrap();
+        assert_eq!(
+            req.pointer("/contents/0/parts/0/text")
+                .and_then(|v| v.as_str()),
+            Some("a cute orange tabby cat")
+        );
+        assert_eq!(
+            req.pointer("/generationConfig/responseModalities/0")
+                .and_then(|v| v.as_str()),
+            Some("IMAGE")
+        );
+    }
+
+    #[test]
+    fn prepare_image_request_rejects_missing_prompt() {
+        let provider = antigravity_image_provider(json!({ "default": "gemini-3-flash-agent" }));
+        let body = serde_json::to_vec(&json!({ "model": "gpt-image-1", "n": 1 })).unwrap();
+        assert!(prepare_antigravity_image_request(&body, &provider).is_err());
     }
 }
