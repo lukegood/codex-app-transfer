@@ -299,7 +299,7 @@
       detailEl.textContent = t(detailKey);
     }
     // 协议切换 → 重渲 mappings UI 让 default required 状态跟当前协议同步
-    // (direct 模式 default 解锁为可空,其他场景仍 required)
+    // (responses 1:1 透传协议 default 解锁为可空,其他场景仍 required)
     setProviderMappings(providerFormMappings);
     // OAuth 模式切换:apiFormat=gemini_cli_oauth 时隐藏 apiKey input,显示 OAuth UI
     setOauthRowState(canonical);
@@ -827,8 +827,8 @@
   }
 
   function isDirectResponsesMode() {
-    // 自定义第三方 + apiFormat=responses → Codex.app 直连上游(direct 模式),
-    // 模型透传给上游,代理不做 alias 翻译 → default mapping 可空。
+    // 自定义第三方 + apiFormat=responses → 代理内 1:1 字节透传给原生 Responses 上游
+    // (MOC-234:不再 direct 直连,但仍 1:1 不做 alias 翻译)→ default mapping 可空。
     return (
       formApiFormatValue === "responses" && !!selectedPreset?.allowApiFormatSelection
     );
@@ -839,7 +839,7 @@
       // [MOC-154] 列表式:行序自动对应 Codex slot(行0=默认→gpt_5_5+default,行1→gpt_5_4
       // ...),用户只填"要在 Codex 显示的模型",不再手动选槽位、不再有 custom 行。
       const isDefault = index === 0;
-      // direct 模式不需要 model alias 映射,默认行也可空;其他场景默认行仍 required
+      // responses 1:1 透传不需要 model alias 映射,默认行也可空;其他场景默认行仍 required
       const isRequired = isDefault && !isDirectResponsesMode();
       const currentProviderModel = providerFormMappings[rowKey] || "";
       return `
@@ -3371,9 +3371,10 @@
 
   async function saveProviderFromForm() {
     const payload = providerPayloadFromForm(true);
-    // Responses 透传协议(direct mode)必须填齐 baseUrl + apiKey,否则 backend
-    // 会 silent fallback 到 local_proxy → Codex.app 经代理 → 行为偏离用户预期。
-    // 前端拦下让用户立即看到错误,而不是后端 fallback 后用户毫无察觉。
+    // Responses 透传协议必须填齐 baseUrl + apiKey:[MOC-234] responses 现统一经
+    // 本地代理做 1:1 字节透传(不再 direct 直连),baseUrl = 代理转发的上游地址、
+    // apiKey = 代理按 provider 注入的上游凭据,缺任一上游都无法转发。前端拦下让
+    // 用户立即看到错误,而不是保存一个转发必失败的 provider。
     if (payload.apiFormat === "responses" || payload.apiFormat === "openai_responses") {
       if (!payload.baseUrl) {
         throw new Error(t("toast.directModeBaseUrlRequired"));
