@@ -585,6 +585,23 @@ export default {
   "settings.showGrayProviders": "Show gray-area providers",
   "settings.showGrayProvidersWarn": "⚠️ Account-ban risk: enabling and using these providers is entirely at your own risk.",
   "settings.showGrayProvidersHint": "Experimental providers such as Gemini CLI and Antigravity are hidden by default.",
+  "settings.pluginUnlock": "Codex plugin unlock",
+  "settings.pluginUnlockHint":
+    "Off / Synthetic (local fake) / Real (logged-in ChatGPT); the latter two need an active provider.",
+  "settings.pluginUnlockOff": "Off",
+  "settings.pluginUnlockSynthetic": "Synthetic",
+  "settings.pluginUnlockReal": "Real",
+  "settings.pluginUnlockFailed": "Failed to switch plugin unlock mode",
+  "settings.realAccountLoginTitle": "Log in to a real ChatGPT account",
+  "settings.realAccountLoginPrompt":
+    "\"Real account\" needs a ChatGPT login on this machine. \"Log in\" opens the browser for OpenAI OAuth; on success it switches to the real account automatically.",
+  "settings.realAccountLoginRunning": "Logging in… complete the authorization in the browser window.",
+  "settings.realAccountLoginGo": "Log in",
+  "settings.realAccountLoginCancelBtn": "Cancel login",
+  "settings.realAccountLoginOk": "Logged in; switching to real account",
+  "settings.realAccountLoginFailed": "Login failed",
+  "settings.realAccountPinFailed":
+    "Logged in, but saving the account failed (check ~/.codex-app-transfer permissions and retry); not switching to real account",
   "settings.autoUnlockCodexPlugins": "Auto-unlock Codex plugins",
   "settings.autoUnlockCodexPluginsHint": "Unlocks Codex plugins. Requires launching Codex from this app.",
   "settings.codexQuotaEnabled": "Show usage in Codex",

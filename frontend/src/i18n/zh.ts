@@ -678,9 +678,23 @@ export default {
     "⚠️ 存在封号风险，开启并使用这些提供商的后果由你自行承担。",
   "settings.showGrayProvidersHint":
     "默认隐藏Gemini CLI、Antigravity 等实验性提供商。",
-  "settings.autoUnlockCodexPlugins": "自动解锁 Codex 插件",
-  "settings.autoUnlockCodexPluginsHint":
-    "此功能需要通过本应用内启动 Codex 才能正常使用。启动后，解锁 codex 插件的使用。",
+  "settings.pluginUnlock": "Codex 插件解锁",
+  "settings.pluginUnlockHint":
+    "关闭 / 模拟账号(本机伪造)/ 真实账号(已登录 ChatGPT);后两者需已激活 provider。",
+  "settings.pluginUnlockOff": "关闭",
+  "settings.pluginUnlockSynthetic": "模拟账号",
+  "settings.pluginUnlockReal": "真实账号",
+  "settings.pluginUnlockFailed": "切换插件解锁模式失败",
+  "settings.realAccountLoginTitle": "登录真实 ChatGPT 账号",
+  "settings.realAccountLoginPrompt":
+    "「真实账号」需要本机已登录 ChatGPT。点「去登录」会打开浏览器走 OpenAI OAuth,完成后自动切到真实账号。",
+  "settings.realAccountLoginRunning": "登录中…请在弹出的浏览器完成授权。",
+  "settings.realAccountLoginGo": "去登录",
+  "settings.realAccountLoginCancelBtn": "取消登录",
+  "settings.realAccountLoginOk": "已登录真实账号,正在切换",
+  "settings.realAccountLoginFailed": "登录失败",
+  "settings.realAccountPinFailed":
+    "登录成功,但账号持久化失败(请检查 ~/.codex-app-transfer 目录权限后重试),暂不切换真实账号",
   "settings.codexQuotaEnabled": "Codex 内显示用量信息",
   "settings.codexQuotaEnabledHint":
     "仅通过本应用启动 Codex 时生效，在 Codex 內显示用量面板:上下文占用、Tokens 速率与累计以及额度信息。",

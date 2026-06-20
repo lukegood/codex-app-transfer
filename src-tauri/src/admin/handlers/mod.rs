@@ -24,6 +24,7 @@ pub mod mcp;
 pub mod mcp_toml;
 pub mod memories_md;
 pub mod plugin_unlock;
+pub mod plugin_unlock_mode;
 pub mod providers;
 pub mod proxy;
 pub mod real_account;

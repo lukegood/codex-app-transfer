@@ -41,6 +41,21 @@ use tower::ServiceExt;
 
 use admin::{build_app_router, handlers, AdminState};
 
+/// [MOC-257 review] 读 `restoreCodexOnExit`(默认 true)。stash 真账号还原(startup self-heal / exit)跟
+/// `restore_codex_if_enabled` 同 gate 在它上:=false 表示「退出不还原、保留 transfer 状态」,此时**不**该把
+/// stash 真账号挪回活动(否则违背意图、real-active 与 persisted off/synthetic 不一致;且 restore_codex 跳过
+/// 后 un-stash 也补不到 managed key)。
+fn restore_codex_on_exit_enabled() -> bool {
+    handlers::settings::load_registry_for_startup_language_sync()
+        .ok()
+        .and_then(|cfg| {
+            cfg.get("settings")
+                .and_then(|s| s.get("restoreCodexOnExit"))
+                .and_then(|v| v.as_bool())
+        })
+        .unwrap_or(true)
+}
+
 fn main() {
     // MCP stdio server 模式 (MOC-144): Codex 把本二进制作为 mcp_server spawn 时带
     // `--mcp-serve-webfetch`。必须在任何可能写 stdout 的初始化(含 telemetry)之前分流 ——
@@ -142,7 +157,26 @@ fn main() {
                     let _ = w.navigate(url);
                 }
             }
-            let _ = handlers::desktop::restore_codex_if_enabled("startup");
+            // [MOC-257 三态] self-heal restore:上次若被强杀(退出 hook 没跑)、真账号被 OFF/synthetic 移到
+            // stash、~/.codex 无 auth.json,整文件还原回去。**顺序同 exit:先 restore_codex_if_enabled,再
+            // un-stash 真账号**([MOC-257 review] 反转,真账号最终写)——原序让 restore_codex 在 stash 还原出的
+            // 真账号上 merge 旧快照 managed auth key,快照拍于 ChatGPT 登录前(无 auth_mode)时会抹掉真账号 genuine
+            // 的 `auth_mode=chatgpt`。改 restore_codex 先跑(还原 config + strip transfer key),再 restore_stashed
+            // 整文件覆盖回真账号 → auth_mode/tokens 全胜过旧快照。原「补 managed key 防空壳」由真账号在后覆盖解决。
+            // 同步版(无 block_on/AUTH_LOCK):此刻在任何 auth task spawn 之前、无并发。失败留痕。
+            // [review] un-stash gate 在 restoreCodexOnExit:=false 表示保留 transfer 状态、跳过。
+            let startup_restore_ok = handlers::desktop::restore_codex_if_enabled("startup")
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            // [MOC-257 review] 同 exit:un-stash 只在 restore 成功后跑;失败则真账号留 stash 待下次 self-heal。
+            if restore_codex_on_exit_enabled() && startup_restore_ok {
+                if let Err(e) = crate::codex_real_account::restore_stashed_real_auth_blocking() {
+                    tracing::error!(
+                        "[PluginUnlock] 启动 stash 真账号还原失败(真账号仍在 stash 待下次重试): {e}"
+                    );
+                }
+            }
 
             // #262:加载 `settings.language` 一次,同步到 adapters 全局,确保
             // startup 后第一个 user 请求的 prompt 注入就是正确语言。后续 user
@@ -245,6 +279,35 @@ fn main() {
             // 回收历史膨胀)。独立 std 线程后台静默跑,幂等(标志位),失败下次启动
             // 重试 —— fire-and-forget,不阻塞 startup,不在 tokio worker 上跑阻塞 IO。
             codex_app_transfer_adapters::responses::session::start_background_session_migration();
+
+            // [MOC-257 三态] 在 auto_apply 之前按生效三态预置 proxy 伪造(synthetic→开),避免「relay
+            // 已通但伪造未开」窄窗里旧 Codex 实例发 /backend-api 透传假 token 被 401。post-apply 的
+            // apply_plugin_unlock_mode 会再校正一次。
+            // [MOC-257 review] **先 migrate 再 resolve**:旧版只有 realAccountModeEnabled=false 等老布尔
+            // 的 legacy config,若不先折叠成 pluginUnlockMode,这里早期 resolve 会按缺键默认从残留 tokens
+            // 推成 real/synthetic、预置错的伪造态(post-apply 的 migrate 才纠正,中间窄窗已发错报文)。
+            let _ = handlers::settings::migrate_plugin_unlock_mode_v1();
+            // [MOC-257 review] 只在 synthetic **且 startup 真会 apply**(autoApplyOnStart + 有 active
+            // provider)时预开伪造器:apply 被跳过(autoApplyOnStart=false / 无 provider)时没写 relay,若仍
+            // 开伪造,旧 / 残留 Codex config 指向本 proxy 的 /backend-api 会被伪造(尽管解锁档没真应用)。
+            let will_apply_synthetic = crate::codex_real_account::resolve_plugin_unlock_mode()
+                == crate::codex_real_account::PluginUnlockMode::Synthetic
+                && handlers::settings::load_registry_for_startup_language_sync()
+                    .ok()
+                    .and_then(|cfg| {
+                        cfg.get("settings")
+                            .and_then(|s| s.get("autoApplyOnStart"))
+                            .and_then(|v| v.as_bool())
+                    })
+                    .unwrap_or(true)
+                && admin::services::desktop::snapshot::active_provider_supports_relay();
+            // [MOC-257 review] 伪造器开 = 本次将 apply synthetic **或** 盘上已是合成态(上次 apply 后
+            // restoreCodexOnExit=false 没还原、auth.json 仍合成 + relay 仍指 proxy)。后者即使本次跳过 apply
+            // 也要保持伪造开,否则 /backend-api 经现存 relay 透传假 token 撞 401。非合成态(active 不是合成
+            // 且不 apply synthetic)则关,避免残留 config 误伪造。
+            codex_app_transfer_proxy::set_fake_account_mode(
+                will_apply_synthetic || crate::codex_real_account::active_is_synthetic(),
+            );
 
             // #MOC-54:保留 JoinHandle,让下面的残留扫描能 await auto_apply
             // 真正跑完(确定性),而不是用固定 sleep 猜它有没有落盘。
@@ -358,85 +421,76 @@ fn main() {
                 // 只做「检测 + 必要时从导入镜像恢复」,杜绝跟外部 Codex 抢 single-use
                 // refresh_token(实测撞刷会触发 refresh_token_reused 把账号烧死)。
                 {
-                    use crate::codex_real_account::ReconcileOutcome;
-                    // [MOC-178 codex P2] 本 spawned task 与同步段的 migrate 无顺序保证 → 首次升级
-                    // 可能在 migrate 前读到 flag=None、跳过下面的 direct 收敛。reconcile 读 flag 前先跑
-                    // migrate(幂等,已设则 no-op),确保读到落定值(有账号→true/无→false,不再 None)。
-                    let _ = handlers::settings::migrate_real_account_mode_v1();
-                    let mut mode_enabled = handlers::settings::read_real_account_mode_enabled();
-                    // [MOC-178 codex P2] provider 不支持 relay(direct 直连 **或无 active provider**)→
-                    // 真实账号 relay 无法生效。即便 flag=true(migrate 落定 / pin / 历史),也持久关 flag +
-                    // 当 false 走 ForceDisable 收敛 apikey,避免「flag on 但 plugins locked」+ direct apply
-                    // apikey 后 reconcile 又恢复 chatgpt 的反复。切回 local_proxy provider 后用户手动再开。
-                    if mode_enabled == Some(true)
-                        && !admin::services::desktop::snapshot::active_provider_supports_relay()
+                    // [MOC-257 三态] 统一插件解锁:迁移旧三开关 → pluginUnlockMode;解析生效三态;apply。
+                    // 本 task 已 await 完 auto_apply,确定性串在 apply 之后(不抢写 auth.json)。
+                    let _ = handlers::settings::migrate_plugin_unlock_mode_v1();
+                    let mode = crate::codex_real_account::resolve_plugin_unlock_mode();
+                    let st = AdminState {
+                        proxy_manager: app_handle_for_residual_scan
+                            .state::<Arc<ProxyManager>>()
+                            .inner()
+                            .clone(),
+                        trace_viewer_manager: Arc::new(trace_viewer::TraceViewerManager::new()),
+                    };
+                    // [MOC-257 review] autoApplyOnStart=false:用户不想启动就自动应用配置 → unlock apply
+                    // 也跳过(否则仅启动就重写 ~/.codex,违背意图;provider auto-apply 已据此跳过,这里对齐)。
+                    let auto_apply_on = handlers::settings::load_registry_for_startup_language_sync()
+                        .ok()
+                        .and_then(|cfg| {
+                            cfg.get("settings")
+                                .and_then(|s| s.get("autoApplyOnStart"))
+                                .and_then(|v| v.as_bool())
+                        })
+                        .unwrap_or(true);
+                    // synthetic/real 需 relay(chatgpt_base_url→proxy)才自洽;无 active provider 时 relay
+                    // 起不来,若仍写合成/真 auth.json,Codex 会直连 chatgpt.com(合成 token 全 401、真账号也
+                    // 绕过 proxy)。无 provider → 跳过 apply(对齐 set 端点 provider gate)。
+                    let relay_ok =
+                        admin::services::desktop::snapshot::active_provider_supports_relay();
+                    if !auto_apply_on {
+                        tracing::info!(
+                            "[PluginUnlock] 启动跳过 unlock apply:autoApplyOnStart=false(尊重「启动不自动应用」)"
+                        );
+                    } else if matches!(
+                        mode,
+                        crate::codex_real_account::PluginUnlockMode::Synthetic
+                            | crate::codex_real_account::PluginUnlockMode::Real
+                    ) && !relay_ok
                     {
-                        let _ = handlers::settings::set_real_account_mode_enabled(false);
-                        mode_enabled = Some(false);
-                    }
-                    match crate::codex_real_account::reconcile_on_startup(mode_enabled).await {
-                        // [MOC-178] 用户主动关了真实账号模式(flag=false),活动可能被退出 restore
-                        // 写回 chatgpt → 收敛回 apikey(保留 tokens),在下方 daemon 决策前完成。
-                        // had_valid_token=false 则无 token 可保留,no-op。
-                        Ok(ReconcileOutcome::ForceDisable { had_valid_token }) => {
-                            if had_valid_token {
-                                tracing::info!(
-                                    "[RealAccount] 真实账号模式已关(flag=false),收敛活动回 apikey(保留 tokens)"
-                                );
-                                let st = AdminState {
-                                    proxy_manager: app_handle_for_residual_scan
-                                        .state::<Arc<ProxyManager>>()
-                                        .inner()
-                                        .clone(),
-                                    trace_viewer_manager: Arc::new(
-                                        trace_viewer::TraceViewerManager::new(),
-                                    ),
-                                };
-                                let _ = admin::services::desktop::snapshot::sync_desktop_clearing_real_account(&st).await;
-                                // [MOC-178 codex P2] sync 依赖 active provider;无 provider(默认
-                                // activeProvider null)/ apply 失败时活动仍 chatgpt → 下方 daemon
-                                // 决策会当 plugins 原生解锁(跟 flag=false 矛盾)。同 forget/enable
-                                // handler,加 deactivate 兜底直接切活动 apikey(不依赖 provider)。
-                                if crate::codex_real_account::active_is_real_chatgpt_now() {
-                                    let _ =
-                                        crate::codex_real_account::deactivate_real_account().await;
-                                }
-                            } else {
-                                tracing::info!(
-                                    "[RealAccount] 真实账号模式已关(flag=false),活动无 token,不收敛"
-                                );
-                            }
-                        }
-                        // [MOC-104] 真实账号失效(镜像 token 本地 JWT 已过期、无法恢复)→ 自动
-                        // 关「自动解锁」开关 + emit 事件让前端提示重新登录。
-                        Ok(ReconcileOutcome::ReloginRequired { .. }) => {
-                            tracing::warn!(
-                                "[RealAccount] 真实账号已失效(需重新登录),自动关闭自动解锁开关"
-                            );
-                            // 关开关只在原本是 on 时有动作;但事件**无论开关原态都 emit**
-                            // (review #6)—— 前端靠这个事件标记「账号已失效」,开关已是
-                            // off 的新装用户也得知道账号失效,否则 detect 见 token 在就误报。
-                            let _ = handlers::settings::disable_auto_unlock_codex_plugins().await;
-                            // [MOC-178 codex P2] 账号 expired 无法恢复 → 也持久关真实账号模式 flag,
-                            // 否则前端据 mode_enabled 派生 toggle 仍 on、future startup 还当 enabled。
-                            // 重登成功 / 重新 import 会再开。[本地审查 MEDIUM] 写失败留痕(本 task 是
-                            // 启动 best-effort、下次 reconcile 重试,relogin 事件已兜底告知用户)。
-                            if !handlers::settings::set_real_account_mode_enabled(false) {
-                                tracing::warn!(
-                                    "[RealAccount] ReloginRequired:flag 写 false 失败(config 不可写),下次启动 reconcile 重试"
-                                );
-                            }
-                            if let Some(window) =
-                                app_handle_for_residual_scan.get_webview_window("main")
+                        tracing::warn!(
+                            "[PluginUnlock] 启动跳过 apply {mode:?}:无 active provider、relay 起不来,不写无 relay 的解锁态"
+                        );
+                    } else {
+                        // [MOC-257 review] real 意图:先跑真账号 reconcile(镜像恢复 / relogin 检测,MOC-104
+                        // 保留)。gate 在**持久 Real 意图**而非 resolved mode —— persisted=real 但账号过期/撤销时
+                        // resolve 已把 mode 降级成 synthetic,按 mode 判会跳过 reconcile + relogin 提示,用户选了
+                        // Real 却不知账号失效、不被提示重登(对齐手动 set 的降级消息)。降级后仍 apply synthetic。
+                        if crate::admin::handlers::settings::read_plugin_unlock_mode().as_deref()
+                            == Some("real")
+                        {
+                            if let Ok(
+                                crate::codex_real_account::ReconcileOutcome::ReloginRequired { .. },
+                            ) = crate::codex_real_account::reconcile_on_startup(Some(true)).await
                             {
-                                let _ = window.emit("real-account-relogin-required", ());
+                                if let Some(window) =
+                                    app_handle_for_residual_scan.get_webview_window("main")
+                                {
+                                    let _ = window.emit("real-account-relogin-required", ());
+                                }
                             }
                         }
-                        Ok(outcome) => tracing::info!(
-                            "[RealAccount] 启动调谐(检测 + 必要时从导入镜像恢复,不刷新): {outcome:?}"
-                        ),
-                        Err(e) => {
-                            tracing::warn!("[RealAccount] 启动调谐失败(忽略): {e}")
+                        match admin::services::desktop::snapshot::apply_plugin_unlock_mode(&st, mode)
+                            .await
+                        {
+                            Ok(()) => tracing::info!("[PluginUnlock] 启动调谐:已应用三态 {mode:?}"),
+                            Err(e) => {
+                                // [MOC-257 review] auth/proxy 回滚**不在这里做**:apply_plugin_unlock_mode
+                                // 已事务化自清理(失败还原 pre-apply 字节 + 视情 re-stash + 关伪造),活动态已
+                                // 回 apply 前。再叠一层 un-stash(restore_stashed)会在自回滚之上重复动作 ——
+                                // 如从「已是合成态 + 真账号在 stash」re-apply synthetic 失败时,把真账号挪回活动、
+                                // 留 persisted synthetic + real-active 无 relay。只 log。
+                                tracing::error!("[PluginUnlock] 启动调谐 apply {mode:?} 失败: {e}");
+                            }
                         }
                     }
                 }
@@ -447,74 +501,8 @@ fn main() {
                 // 这里不启 daemon;daemon 只留给「无真实账号 + 显式强制开启」档(下方 task)。
             });
 
-            // ── [MOC-104] 真实账号解锁一次性迁移 ──
-            // 老版本 autoUnlockCodexPlugins 默认 true 会直接拉起 CDP 伪造注入 daemon;真实
-            // 账号模式上线后,**无真实账号时**的高延迟 CDP 路径改为「显式强制开启」才走。
-            // 同步执行(在 daemon 决策 + 任何 Codex 启动前),硬重置升级用户残留的旧 true。幂等。
-            if handlers::settings::migrate_real_account_unlock_v1() {
-                tracing::info!(
-                    "[RealAccount] 一次性迁移:硬重置 autoUnlockCodexPlugins=false(无真实账号时的高延迟 CDP 改为显式强制开启)"
-                );
-            }
-            // ── Plugin Unlock 守护进程自动启动 ──
-            // [MOC-104] daemon = CDP 注入 `setAuthMethod('chatgpt')`,把 React authMethod
-            // 伪造成 chatgpt 来解锁 Plugins 入口。它**只**对「活动 auth.json 是 apikey」的
-            // 用户有意义,且伪造态与磁盘 apikey 不匹配 → Codex 重新初始化登录态(MOC-100
-            // ~5.8s 高延迟)。relay 模式上线后:
-            // ① 活动是真实 chatgpt → Codex 据 `auth_mode==chatgpt` **原生**显示 Plugins,
-            //    **不启 daemon**(无注入、无不匹配、无高延迟);apply.rs relay 分支保证切
-            //    provider 时也保留 chatgpt 态,入口持续可见。
-            // ② 活动是 apikey + 用户显式强制开启 → 跑 daemon(伪造,用户已接受高延迟);
-            // ③ 活动是 apikey + 未强制开启 → 不跑(消除「默默高延迟」,用户原始诉求)。
-            // 复用 handlers::plugin_unlock 的 OnceCell 单例(否则跟前端手动 start 各跑一份)。
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-                // [MOC-104] 真实 chatgpt 活动 → Codex 原生显示 plugins,绝不启 daemon
-                // (relay 模式核心:无注入、无不匹配、无 MOC-100 高延迟)。
-                // [MOC-178 codex P2] 但 flag=false(用户主动关真实账号模式)时,活动 chatgpt 是退出
-                // restore 写回的 stale 态(post-apply task 的 reconcile ForceDisable 会切回 apikey)——
-                // 本 daemon task 与 reconcile 各自 spawn、无顺序保证,只看 active_is_real_chatgpt_now
-                // 会误判 relay 而 return、漏掉 force 用户的 daemon。flag=false 时按 force_cdp 判定
-                // (用持久 flag 而非 stale 活动态做决策,不依赖 sleep ordering)。
-                // [MOC-178 codex P2] daemon task 与 reconcile task 各自 spawn,migrate 在 reconcile
-                // task 内(第十二轮);本 task 读 flag 前也跑一次 migrate(幂等)保证读到落定值 —— 否则
-                // 首次启动 flag=None 时 mode_off=false、误当 relay active return,不启用户的 force daemon。
-                let _ = handlers::settings::migrate_real_account_mode_v1();
-                let mode_off =
-                    handlers::settings::read_real_account_mode_enabled() == Some(false);
-                // [MOC-178 codex P2] relay 真生效还需 provider 支持 relay —— direct/无 provider 下即使
-                // 活动是 chatgpt(exit-restore stale、reconcile 会切 apikey)也不该当 relay valid skip
-                // daemon,否则 force 用户的 CDP daemon 不启(reconcile 切 apikey 后 force 没 daemon 没解锁)。
-                if !mode_off
-                    && crate::codex_real_account::active_is_real_chatgpt_now()
-                    && admin::services::desktop::snapshot::active_provider_supports_relay()
-                {
-                    tracing::info!(
-                        "[PluginUnlock] 真实 chatgpt 账号活动,Codex 原生显示 plugins,不启 daemon(relay 模式)"
-                    );
-                    return;
-                }
-
-                // 无真实账号:仅用户显式强制开启(高延迟 CDP 伪造注入)才跑 daemon。
-                // 迁移后默认 false;只有强制开启 / 用户手动开开关才 true。
-                let force_cdp = match crate::admin::registry_io::load() {
-                    Ok(cfg) => cfg
-                        .get("settings")
-                        .and_then(|s| s.get("autoUnlockCodexPlugins"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    Err(_) => false,
-                };
-                if force_cdp {
-                    tracing::info!("[PluginUnlock] 无真实账号 + 用户强制开启(高延迟 CDP),启动 daemon");
-                    handlers::plugin_unlock::get_service().await.start();
-                } else {
-                    tracing::info!(
-                        "[PluginUnlock] 无真实账号且未强制开启,不启 daemon(避免默默高延迟)"
-                    );
-                }
-            });
+            // [MOC-257 三态] CDP 自动解锁 daemon 已废弃(synthetic 三态更可靠、自洽取代)。
+            // 插件解锁三态由上面 post-apply task 的 apply_plugin_unlock_mode 统一应用,不再启 CDP daemon。
 
             let menu = build_tray_menu(app)?;
             // 菜单栏专属图标:白+透明猫剪影模板图(非全彩 app 图标缩小, 后者在 22px 菜单栏糊成一团)。
@@ -686,7 +674,29 @@ fn main() {
             if crate::codex_real_account::cancel_login() {
                 tracing::info!("app exit: 已取消 in-flight codex login,防孤儿进程退出后改写 auth.json");
             }
-            let _ = handlers::desktop::restore_codex_if_enabled("exit");
+            // [MOC-257 三态] 退出前先把 OFF/synthetic 移走的真账号 stash 整文件还原回 ~/.codex/auth.json
+            // 顺序:**先 restore_codex_if_enabled,再 un-stash 真账号**([MOC-257 review] 反转,真账号最终写)。
+            // 原序(先 un-stash 再 restore_codex)让 restore_codex 在 stash 还原出的真账号上 merge 旧快照 managed
+            // auth key:若快照拍于用户**登录 ChatGPT 之前**(无 `auth_mode`),merge 会把真账号 genuine 的
+            // `auth_mode=chatgpt` 抹掉 → tokens 在但 standalone Codex 不再认作 ChatGPT。改为 restore_codex 先跑
+            // (还原 config + strip transfer auth key),再 restore_stashed 把**完整真账号整文件覆盖**回活动 →
+            // 真账号的 auth_mode/tokens 全胜过旧快照。原「补 managed key 防空壳」顾虑由「真账号在后覆盖」解决。
+            // **同步版**:exit 期 async runtime 可能正在 shutdown,block_on 异步锁会 panic → 同步纯文件操作避开。
+            // [review] un-stash gate 在 restoreCodexOnExit:=false 表示退出保留 transfer 状态,不该 un-stash。
+            let exit_restore_ok = handlers::desktop::restore_codex_if_enabled("exit")
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            // [MOC-257 review] un-stash 只在 restore **成功**后跑:restore_codex 失败(快照不可读 / ~/.codex 锁)
+            // 时仍 un-stash 会留真账号 active + 没还原成功的 transfer relay/config 在盘上 → 下次启动 persisted
+            // off/synthetic 却 real-active 不一致。失败则真账号留 stash,下次启动 self-heal 重试。
+            if restore_codex_on_exit_enabled() && exit_restore_ok {
+                if let Err(e) = crate::codex_real_account::restore_stashed_real_auth_blocking() {
+                    tracing::error!(
+                        "[PluginUnlock] 退出 stash 真账号还原失败(真账号仍在 stash 待下次启动重试): {e}"
+                    );
+                }
+            }
             // MOC-144:transfer 注入的 web_fetch MCP server 在退出时从 Codex config.toml 移除
             // —— 它是 transfer 管理的工具, transfer 不在时不该残留 [mcp_servers.cat-webfetch]
             // (注入/移除对称;下次 transfer 启动 re-sync 会按 webFetchBackend 重新注册)。
@@ -741,9 +751,32 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
             let provider_id = provider_id.to_owned();
             let app_handle = app.clone();
             let proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
+            let trace_viewer_manager = app
+                .state::<Arc<trace_viewer::TraceViewerManager>>()
+                .inner()
+                .clone();
             tauri::async_runtime::spawn(async move {
                 let _ =
-                    handlers::desktop::switch_provider_and_sync(proxy_manager, provider_id).await;
+                    handlers::desktop::switch_provider_and_sync(proxy_manager.clone(), provider_id)
+                        .await;
+                // [MOC-257 review] 托盘切 provider 走 switch_provider_and_sync 直调(绕过 set_default/
+                // add_provider handler 的 re-apply)→ 这里补上:切 provider 后 relay 可用,重 apply 当前
+                // 生效三态(非 off),否则无 provider 时启动跳过的 synthetic/real unlock 仍不生效。
+                let mode = crate::codex_real_account::resolve_plugin_unlock_mode();
+                if !matches!(mode, crate::codex_real_account::PluginUnlockMode::Off) {
+                    let st = AdminState {
+                        proxy_manager,
+                        trace_viewer_manager,
+                    };
+                    if let Err(e) =
+                        admin::services::desktop::snapshot::apply_plugin_unlock_mode(&st, mode)
+                            .await
+                    {
+                        tracing::warn!(
+                            "[PluginUnlock] 托盘切 provider 后 apply {mode:?} 失败: {e}"
+                        );
+                    }
+                }
                 refresh_tray_menu(&app_handle);
             });
         }

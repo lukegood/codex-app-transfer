@@ -110,10 +110,26 @@ pub struct ApplyResult {
 
 /// 把 active provider 配置写入 `~/.codex/{config.toml,auth.json}`,
 /// 首次写入前自动 snapshot。
+/// 从 `http://host:port[/path]` 解析端口(供 snapshot signature-strip 识别 transfer relay 字段;解析不到默认
+/// 历史 18080)。[MOC-257 review] 自定义 proxyPort 时让快照反投毒认得当前端口。
+fn proxy_port_from_url(base_url: &str) -> u16 {
+    base_url
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.split('/').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(18080)
+}
+
 pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResult, CodexError> {
     // 1. snapshot(幂等;已有快照不会覆盖)
     let snapshot_taken_now = !has_snapshot(paths);
-    snapshot_codex_state(paths, cfg.app_version, cfg.provider_name)?;
+    snapshot_codex_state(
+        paths,
+        cfg.app_version,
+        cfg.provider_name,
+        &[proxy_port_from_url(cfg.base_url), 18080],
+    )?;
 
     // 2. config.toml: openai_base_url
     if cfg.base_url.is_empty() {
@@ -546,8 +562,32 @@ fn restore_from_snapshot_values(
         sync_table_field(&paths.config_toml, section, key, literal.as_deref())?;
     }
 
-    // 2. auth.json:对每个 managed key,快照里有就改回快照值,没有就 remove
+    // 2. auth.json
     let mut current = read_auth(&paths.auth_json)?;
+    // [MOC-257 review] live auth 是**合成**(`cas_synthetic`,transfer 伪造)时,只 strip managed key 会留
+    // `cas_synthetic` + 假 tokens → 下次 `active_is_synthetic()` 仍 true、re-enable 伪造/起 proxy(即便 restore
+    // 跑过)。合成绝非用户原始 → **整体处理**:快照有真 auth(anti-poisoning 保证非合成)就整文件换回;快照无
+    // auth(原本就没 / 合成被反投毒跳过)就删掉合成。非合成(真账号/apikey)才走下面的 managed-key merge。
+    let live_is_synthetic = current
+        .get("cas_synthetic")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if live_is_synthetic {
+        if snapshot_auth.as_object().is_some_and(|o| !o.is_empty()) {
+            write_auth(&paths.auth_json, snapshot_auth)?;
+        } else if paths.auth_json.exists() {
+            std::fs::remove_file(&paths.auth_json)?;
+        }
+        return Ok(());
+    }
+    // 非合成:对每个 managed key,快照里有就改回快照值,没有就 remove。
+    // [MOC-257 review] genuine chatgpt 登录(auth_mode=chatgpt,已过上面 synthetic 过滤 = 真账号):**Auto
+    // restore**(退出/启动)下若快照拍于该登录**之前**(无 auth_mode)→ **保留** auth_mode,别 strip。否则用户
+    // 后登录的真账号(active / Real 模式;账号 pin 在 mirror 非 stash、reverse-order 的 restore_stashed 也兜不到)
+    // 被 merge 抹掉 auth_mode → tokens 在但 standalone Codex 不认作 chatgpt、插件不可用。**Manual restore**(UI
+    // 选老快照)语义是精确回到那个快照 → 仍 strip;apikey 模式 live 也仍 strip(撤 transfer 写的 apikey)。
+    let live_is_chatgpt =
+        current.get("auth_mode").and_then(serde_json::Value::as_str) == Some("chatgpt");
     if let Some(obj) = current.as_object_mut() {
         for key in MANAGED_AUTH_KEYS {
             match snapshot_auth.get(*key) {
@@ -555,6 +595,9 @@ fn restore_from_snapshot_values(
                     obj.insert((*key).to_owned(), v.clone());
                 }
                 None => {
+                    if *key == "auth_mode" && live_is_chatgpt && matches!(mode, RestoreMode::Auto) {
+                        continue; // 保留 genuine chatgpt 登录的 auth_mode
+                    }
                     obj.remove(*key);
                 }
             }

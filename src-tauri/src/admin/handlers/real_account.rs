@@ -231,6 +231,17 @@ pub async fn forget_handler(
 pub async fn enable_handler(
     axum::extract::State(state): axum::extract::State<AdminState>,
 ) -> impl IntoResponse {
+    // [MOC-257 review] 与模拟账号(synthetic)互斥:活动是合成账号时,detect 会当真账号通过、
+    // activate_real_account 会 no-op 把合成账号"激活成真账号"。先拦。判据改用 `active_is_synthetic()`
+    // (活动哨兵),**不读已废弃的 `fakeAccountModeEnabled` 键**(三态从不写它,旧守卫永远失效)。
+    // 注:此 legacy real-account 入口现已不被新前端调用,三态 set real 才是正路。
+    if codex_real_account::active_is_synthetic() {
+        return err(
+            StatusCode::CONFLICT,
+            "当前是模拟账号(合成)态;如要用真实账号,请在「插件解锁」选「真实账号」".to_owned(),
+        )
+        .into_response();
+    }
     // 账号可用性(新口径认 token,清除切 apikey 后 tokens 还在也算有)。
     let status = codex_real_account::detect();
     if !status.logged_in {

@@ -59,7 +59,9 @@ pub(super) fn default_config_value() -> Value {
            "showGrayProviders": false,
            "restoreCodexOnExit": true,
            "mcpCredentialsPortableStore": true,
-           "autoUnlockCodexPlugins": false,
+            // [MOC-257 review] **不**在默认配置里 seed legacy `autoUnlockCodexPlugins`(已废弃,三态取代)——
+            // 否则 normalize_imported_config 给缺该键的导入配置补 false,migrate 会把这个**生成的默认**当成用户
+            // 显式 opt-out 迁成 off,绕过「无真账号→synthetic」缺键默认。缺键 = migrate None = 走默认推导。
             "autoWakeCodexPet": true,
            "updateUrl": DEFAULT_UPDATE_URL
         }
@@ -481,57 +483,6 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
     }
 }
 
-/// [MOC-104] 真实账号失效时自动关「自动解锁 Codex Plugins」开关 + 停 daemon。
-/// 仅在当前为 on 时动作(返回 `true`),避免重复 no-op。复用 save_settings 同款
-/// "开关变更即时停 daemon"逻辑。
-pub async fn disable_auto_unlock_codex_plugins() -> bool {
-    let changed = with_config_write(|cfg| {
-        let was_on = cfg
-            .get("settings")
-            .and_then(|s| s.get("autoUnlockCodexPlugins"))
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        if !was_on {
-            return Ok(ConfigMutation::Unchanged(false));
-        }
-        ensure_settings_object(cfg).insert("autoUnlockCodexPlugins".to_owned(), Value::Bool(false));
-        Ok(ConfigMutation::Modified(true))
-    })
-    .unwrap_or(false);
-    if changed {
-        crate::admin::handlers::plugin_unlock::get_service()
-            .await
-            .stop()
-            .await;
-    }
-    changed
-}
-
-/// [MOC-104] 一次性迁移:老版本 `autoUnlockCodexPlugins` 默认 true 直接驱动 CDP 伪造
-/// 注入 daemon —— 但只有活动 auth.json 不是真实 chatgpt 时该注入才造成不匹配 →
-/// Codex 启动重新初始化(高延迟)。真实账号模式上线后,高延迟 CDP 路径改为「显式
-/// 强制开启」才走;升级用户残留的旧 `true` 不该默默把人按在高延迟路径上。
-///
-/// 首次启动检测到没迁移过 → **硬重置 `autoUnlockCodexPlugins=false`**(用户指示),
-/// 之后只有「强制开启」按钮 / 用户手动开开关才会置回 true。幂等:迁移标记已置则
-/// no-op,不会反复覆盖用户后来的选择。返回本次是否执行了重置(供日志)。
-pub fn migrate_real_account_unlock_v1() -> bool {
-    with_config_write(|cfg| {
-        let s = ensure_settings_object(cfg);
-        let already = s
-            .get("realAccountUnlockMigratedV1")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if already {
-            return Ok(ConfigMutation::Unchanged(false));
-        }
-        s.insert("realAccountUnlockMigratedV1".to_owned(), Value::Bool(true));
-        s.insert("autoUnlockCodexPlugins".to_owned(), Value::Bool(false));
-        Ok(ConfigMutation::Modified(true))
-    })
-    .unwrap_or(false)
-}
-
 /// [MOC-178] 真实账号模式持久开关(用户意图)。三态:键缺失=未设(走迁移)/ true=开 / false=
 /// 用户主动关。**独立于活动 auth.json、不被退出 restore 撤销** —— 解决「清除后重启又自动开」。
 /// 跟 `autoUnlockCodexPlugins`(无账号时的强制 CDP daemon 档)是两个独立开关。
@@ -553,32 +504,126 @@ pub fn set_real_account_mode_enabled(enabled: bool) -> bool {
     .unwrap_or(false)
 }
 
-/// [MOC-178] 一次性迁移:首次落定 `realAccountModeEnabled` 初值,不突变老用户。键已存在 →
-/// no-op(幂等);不存在 → 按当前是否有可用真实账号(`detect().logged_in`,新口径认 token)
-/// 决定:有账号 → true(老用户保持开)、无账号 → false(与现状一致)。返回是否执行了写入。
-pub fn migrate_real_account_mode_v1() -> bool {
-    let already = crate::admin::registry_io::load()
-        .ok()
-        .map(|cfg| {
-            cfg.get("settings")
-                .and_then(|s| s.get("realAccountModeEnabled"))
-                .is_some()
-        })
-        .unwrap_or(false);
-    if already {
-        return false;
+/// [MOC-257 三态] 插件解锁三态选择器持久值(用户意图):`"off"` / `"synthetic"` / `"real"`。
+/// **键缺失 = 未手动设**,由 [`crate::codex_real_account::resolve_plugin_unlock_mode`] 按「本地有
+/// 真账号 auth.json → real;否则 → synthetic」推导默认。取代旧的 `autoUnlockCodexPlugins`(CDP 档,
+/// 已废弃)+ `fakeAccountModeEnabled` + `realAccountModeEnabled` 三个布尔开关。
+pub fn read_plugin_unlock_mode() -> Option<String> {
+    crate::admin::registry_io::load().ok().and_then(|cfg| {
+        cfg.get("settings")
+            .and_then(|s| s.get("pluginUnlockMode"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+/// [MOC-257 三态] 写三态选择器持久值。三态切换 handler 经这里落用户意图;`off` 是持久关闭意图,
+/// 重启后仍把 auth.json 转移备份(见 codex_real_account stash)。
+pub fn set_plugin_unlock_mode(mode: &str) -> bool {
+    with_config_write(|cfg| {
+        ensure_settings_object(cfg).insert(
+            "pluginUnlockMode".to_owned(),
+            Value::String(mode.to_owned()),
+        );
+        Ok(ConfigMutation::Modified(true))
+    })
+    .unwrap_or(false)
+}
+
+/// [MOC-257 review] 删 `pluginUnlockMode` 键(回到默认推导)。set 端点 apply 失败回滚用:若切换前本无
+/// 键(走默认),回滚到无键而非某个固定值。键不存在 → no-op。成功返 true。
+pub fn clear_plugin_unlock_mode() -> bool {
+    with_config_write(|cfg| {
+        if let Some(s) = cfg.get_mut("settings").and_then(Value::as_object_mut) {
+            s.remove("pluginUnlockMode");
+        }
+        Ok(ConfigMutation::Modified(true))
+    })
+    .unwrap_or(false)
+}
+
+/// [MOC-257 三态] 一次性迁移:把旧三开关折叠成 `pluginUnlockMode`。键已存在 → no-op(幂等)。
+/// 映射:`fakeAccountModeEnabled=true` → synthetic;`realAccountModeEnabled=true` → real;
+/// **`realAccountModeEnabled=false`(显式关闭意图)→ off**(否则默认推导会从 deactivate 留下的
+/// tokens 推成 real、撤销用户的关闭意图,review P2);`autoUnlockCodexPlugins=true`(旧 CDP 强制档,
+/// 现由 synthetic 取代)→ synthetic;都没有 → **不写键**(留给默认推导:有真账号→real / 无→synthetic)。
+pub fn migrate_plugin_unlock_mode_v1() -> bool {
+    let cfg = match crate::admin::registry_io::load() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let s = cfg.get("settings");
+    if s.and_then(|s| s.get("pluginUnlockMode")).is_some() {
+        // [MOC-257 review] 已迁移(有 pluginUnlockMode),但**仍清残留 legacy autoUnlockCodexPlugins**:早期 build
+        // 写了新键却没清旧键 / 导入的配置带旧键 → launcher `should_attach_debug_port`(process.rs)+ 设置热重载
+        // 仍读它开 Codex 远程调试端口 / 旧 CDP 路径。存在则清掉(否则升级用户即便已迁移仍以调试端口启 Codex)。
+        if s.and_then(|s| s.get("autoUnlockCodexPlugins")).is_some() {
+            return with_config_write(|cfg| {
+                if let Some(set) = cfg.get_mut("settings").and_then(Value::as_object_mut) {
+                    set.remove("autoUnlockCodexPlugins");
+                }
+                Ok(ConfigMutation::Modified(true))
+            })
+            .unwrap_or(false);
+        }
+        return false; // 已迁移 + 无 legacy 残留
     }
-    // [MOC-178 codex P2] seed 只认「活动**真** chatgpt」(relay 在用),不用 detect().logged_in ——
-    // 后者认 token,会把「chatgpt login 后切 apikey、活动 auth_mode=apikey 但 tokens 残留」误判成
-    // 有账号 → flag=true 但 reconcile 无法从 token-only apikey activate、前端却据 flag 显示 mode on
-    // (plugins 仍 locked)。活动真 chatgpt 才是「之前在用真实账号 relay」的可靠信号。
-    // [MOC-178 codex P2] seed = 活动真 chatgpt(relay 在用)**或**有可恢复的导入镜像(import/pin 过、
-    // legacy reconcile 会从镜像恢复)。只认前者会把「有有效镜像但活动 apikey」的老用户误 seed false →
-    // reconcile(Some(false)) 走 ForceDisable 在读镜像前就关了,静默禁用其真实账号模式。仍排除
-    // token-only apikey 活动文件(active_is_real_chatgpt_now 要 auth_mode==chatgpt、镜像分支判过期)。
-    let has_account = crate::codex_real_account::active_is_real_chatgpt_now()
-        || crate::codex_real_account::has_restorable_imported_mirror();
-    set_real_account_mode_enabled(has_account)
+    let b = |k: &str| {
+        s.and_then(|s| s.get(k))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    // [MOC-257 review] 显式取真实账号 / 强制解锁键,区分「缺失」vs「Some(false)」—— 后者是用户主动关闭意图,
+    // 不能跟缺失一样 fall through 到 None(会被 resolve 默认重新推成 synthetic/real)。
+    let real_explicit = s
+        .and_then(|s| s.get("realAccountModeEnabled"))
+        .and_then(Value::as_bool);
+    let auto_unlock = s
+        .and_then(|s| s.get("autoUnlockCodexPlugins"))
+        .and_then(Value::as_bool);
+    let mode = if b("fakeAccountModeEnabled") {
+        Some("synthetic")
+    } else if real_explicit == Some(true) {
+        Some("real")
+    } else if real_explicit == Some(false) {
+        // [MOC-257 review] 显式关真账号:开了 CDP 强制解锁仍要解锁 → synthetic(否则 off 会把插件关了,CDP
+        // daemon 迁移后不再启);没开 → off(不被默认推导从残留 tokens 翻成 real)。
+        Some(if auto_unlock == Some(true) {
+            "synthetic"
+        } else {
+            "off"
+        })
+    } else if auto_unlock == Some(true) {
+        // [MOC-257 review] 老 CDP 强制解锁、**无**显式真账号设置:有**可用真账号** → real(用真账号解锁,
+        // 对齐缺键默认 resolve 的「有真账号→real」),否则 synthetic(无真账号也要解锁)。不能一律 synthetic,
+        // 否则升级用户的可用真账号被 stash、真插件/backend 换成假空市场。
+        Some(if crate::codex_real_account::real_account_usable() {
+            "real"
+        } else {
+            "synthetic"
+        })
+    } else if auto_unlock == Some(false) {
+        // [MOC-257 review] **显式关**强制解锁(且无其它显式模式)→ off。别跟缺键一样 fall through 到 None,
+        // 否则 resolve 默认从残留 tokens 把用户已关的解锁重新推成 synthetic/real、启动又打开。
+        Some("off")
+    } else {
+        None // autoUnlock 也缺 → 留给默认推导
+    };
+    match mode {
+        Some(m) => {
+            // [MOC-257 review] 设新三态 **+ 清掉 legacy autoUnlockCodexPlugins**:它迁移后仍被 launcher
+            // `should_attach_debug_port` + settings 热重载消费(开 Codex 远程调试端口 / 旧 CDP 解锁路径),新 UI
+            // 不再暴露 → 留 true 会让升级用户即便迁到 synthetic/real 仍以调试端口启 Codex。同写一次避免中间态。
+            with_config_write(|cfg| {
+                let s = ensure_settings_object(cfg);
+                s.insert("pluginUnlockMode".to_owned(), Value::String(m.to_owned()));
+                s.remove("autoUnlockCodexPlugins");
+                Ok(ConfigMutation::Modified(true))
+            })
+            .unwrap_or(false)
+        }
+        None => false,
+    }
 }
 
 /// #262:把 `settings.language` 同步到 adapters 全局 [`codex_app_transfer_adapters::core::language`]。

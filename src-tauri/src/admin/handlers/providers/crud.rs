@@ -183,7 +183,10 @@ pub struct AddProviderInput {
     pub review_model_slot: Option<String>,
 }
 
-pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoResponse {
+pub async fn add_provider(
+    State(state): State<AdminState>,
+    Json(input): Json<AddProviderInput>,
+) -> impl IntoResponse {
     // 校验 extraHeaders 在保存前合法,避免运行时静默丢 header(实测痛点:Kimi
     // KimiCLI UA 字符串带换行 → resolver 运行时 HeaderValue::from_str 失败 →
     // WARN 后跳过 → Kimi 上游 403 但用户看不到原因)
@@ -229,6 +232,9 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
         }
     }
 
+    // [MOC-257 review] 标记本次是否新建了「首个 provider」(自动成 active)——闭包内置位,闭包外据此补
+    // apply unlock(Cell 内部可变,只读借用即可在 FnMut 闭包里 set)。
+    let became_first_active = std::cell::Cell::new(false);
     let new_provider_value = match with_config_write(|cfg| {
         let providers = cfg
             .get("providers")
@@ -317,6 +323,7 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
         let mut new_providers = providers;
         new_providers.push(new_provider_value.clone());
         let was_empty = new_providers.len() == 1;
+        became_first_active.set(was_empty);
 
         let obj = cfg.as_object_mut().unwrap();
         obj.insert("providers".into(), Value::Array(new_providers));
@@ -328,6 +335,20 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    // [MOC-257 review] 加的是**首个** provider(自动成 active)→ relay 刚变可用,补 apply 当前生效三态
+    // (同 set_default_provider):否则无 provider 时启动跳过的 synthetic/real unlock 永不生效。add 走的
+    // 不是 /default 路径,故这里单独补。off 不依赖 provider、无需。idempotent + best-effort。
+    if became_first_active.get() {
+        let mode = crate::codex_real_account::resolve_plugin_unlock_mode();
+        if !matches!(mode, crate::codex_real_account::PluginUnlockMode::Off) {
+            if let Err(e) =
+                crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(&state, mode)
+                    .await
+            {
+                tracing::warn!("[PluginUnlock] 加首个 provider 后 apply {mode:?} 失败: {e}");
+            }
+        }
+    }
     Json(json!({"success": true, "provider": public_provider(&new_provider_value)})).into_response()
 }
 
@@ -546,6 +567,18 @@ pub async fn set_default_provider(
 ) -> impl IntoResponse {
     let result = switch_provider_and_sync(state.proxy_manager.clone(), id).await;
     if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        // [MOC-257 review] 激活/切 provider 后 relay 可用了 → 重新 apply 当前生效三态(synthetic/real),
+        // 弥补「无 provider 时启动跳过的 unlock apply」:否则 status 一直报 resolve 默认 synthetic 却从没真
+        // apply、前端 re-select 同档 no-op、unlock 永不生效。off 不依赖 provider、无需。idempotent + best-effort。
+        let mode = crate::codex_real_account::resolve_plugin_unlock_mode();
+        if !matches!(mode, crate::codex_real_account::PluginUnlockMode::Off) {
+            if let Err(e) =
+                crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(&state, mode)
+                    .await
+            {
+                tracing::warn!("[PluginUnlock] 切 provider 后重 apply {mode:?} 失败: {e}");
+            }
+        }
         Json(result).into_response()
     } else {
         let status = if result.get("message").and_then(|v| v.as_str()) == Some("provider not found")

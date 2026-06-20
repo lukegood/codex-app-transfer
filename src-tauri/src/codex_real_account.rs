@@ -29,7 +29,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -70,6 +70,9 @@ pub struct RealAccountStatus {
     /// [connector review] 持久化到可查询的 status,而非只靠一次性 `emit` 事件 —— 启动时
     /// 若前端还没注册 listener,事件会丢;前端轮询 status 时读这个字段就不会漏报失效。
     pub relogin_required: bool,
+    /// [MOC-257] 活动账号是否是「模拟(伪造)账号」(合成 auth.json,带 `cas_synthetic` 哨兵)。
+    /// 前端据此显示「模拟账号」而非「真实账号」、隐藏 pin/导入(伪造账号不入持久镜像)。
+    pub is_synthetic: bool,
 }
 
 impl RealAccountStatus {
@@ -81,6 +84,7 @@ impl RealAccountStatus {
             source: AuthSource::None,
             has_imported,
             relogin_required: relogin_required(),
+            is_synthetic: active_is_synthetic(),
         }
     }
 }
@@ -182,27 +186,6 @@ pub fn active_is_real_chatgpt_now() -> bool {
     CodexPaths::from_home_env()
         .map(|p| active_is_real_chatgpt(&p))
         .unwrap_or(false)
-}
-
-/// [MOC-178 codex P2] 是否有「可恢复的」导入镜像(存在 + access/refresh 非空 + 本地 JWT 未过期)。
-/// 供 migrate seed 判定「老用户之前在用真实账号」—— 有有效镜像 = 用户导入/钉住过、legacy
-/// reconcile 会从它恢复活动 chatgpt。只读,不写盘。
-pub fn has_restorable_imported_mirror() -> bool {
-    let Ok(paths) = CodexPaths::from_home_env() else {
-        return false;
-    };
-    let Some(v) = read_imported_mirror(&paths) else {
-        return false;
-    };
-    if parse_chatgpt_tokens(&v).is_none() {
-        return false;
-    }
-    let access = v
-        .get("tokens")
-        .and_then(|t| t.get("access_token"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    !access_token_expired(access, chrono::Utc::now().timestamp())
 }
 
 /// 从一个 `auth.json` Value 判断是否是**可用**的 chatgpt 登录态。
@@ -434,6 +417,21 @@ pub fn detect() -> RealAccountStatus {
     // auth_mode —— 清除切 apikey 后 tokens 仍在且未过期 → 账号状态仍「获取成功」、用户可再开。
     match locate_valid_chatgpt_tokens(&paths) {
         Some(found) => {
+            // [MOC-257 review] 活动是**合成账号**:它不是真账号(只是 chatgpt-shaped 占位),locate 会把它
+            // 当 Official 有效 token。但**不**能走真账号自愈 —— `clear_relogin_state` 会因合成指纹 ≠ 被撤销
+            // 真账号指纹而清掉撤销标记,使 stash 里被撤销的真账号「看起来可用」、后续切回 Real 撞 401;也不
+            // 报 logged_in(它不是真登录)。is_synthetic 透出供前端区分。
+            if found.value.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+                return RealAccountStatus {
+                    logged_in: false,
+                    active_auth_mode: active_mode,
+                    account_id: None,
+                    source: AuthSource::None,
+                    has_imported,
+                    relogin_required: relogin_required(),
+                    is_synthetic: true,
+                };
+            }
             // [connector review 自愈] 活动文件就是有效真实 chatgpt = 账号当前确实可用 → 清掉可能
             // stale 的「需重新登录」标记(覆盖 app 外重新 codex login / 直接恢复活动文件场景)。
             // [MOC-124 H-2] 但**只在 token 真换了**时清:proxy 401 回灌记下了被撤销 token 的指纹,
@@ -456,6 +454,7 @@ pub fn detect() -> RealAccountStatus {
                 source: found.source,
                 has_imported,
                 relogin_required: relogin_required(),
+                is_synthetic: active_is_synthetic(),
             }
         }
         None => {
@@ -620,6 +619,8 @@ fn backup_active_auth(paths: &CodexPaths, suffix: &str) -> Result<(), String> {
     let backup = backup_dir.join(format!("auth-{suffix}-{ts}.json"));
     std::fs::copy(&paths.auth_json, &backup)
         .map_err(|e| format!("备份活动 auth.json 失败: {e}"))?;
+    // [MOC-257 review] copy 保留源权限,源若 0644 → 备份(含真账号 token)也 0644 → 共享 home 可读;强制 0600。
+    set_auth_file_private(&backup);
     Ok(())
 }
 
@@ -637,6 +638,14 @@ fn read_imported_mirror(paths: &CodexPaths) -> Option<Value> {
     let mirror = imported_mirror_path(paths);
     let v = read_auth(&mirror).ok()?;
     parse_chatgpt_auth(&v).map(|_| v)
+}
+
+/// [MOC-257 review] 读镜像**原始** Value(不经 `read_imported_mirror` 的 `parse_chatgpt_auth`(只认 auth_mode=
+/// chatgpt)filter)。供「真账号是否可用」判定 + activate 恢复:镜像若 auth_mode=apikey 但带可用 chatgpt tokens
+/// (早期 build 镜像 / 切过 auth 模式的拷贝),用 `auth_value_real_and_usable`(查 tokens 非 auth_mode)判 + 由
+/// caller `normalize_real_auth_to_chatgpt` 规整,避免 chatgpt-only filter 漏判致 persisted Real 误降级 synthetic。
+fn read_imported_mirror_raw(paths: &CodexPaths) -> Option<Value> {
+    read_auth(&imported_mirror_path(paths)).ok()
 }
 
 /// import 内层(**假设 caller 已持 `AUTH_LOCK`**):备份活动 → 写活动 → 提交持久镜像。
@@ -679,6 +688,11 @@ pub async fn import_auth(source_path: String) -> Result<(), String> {
             "不是可用的 chatgpt auth.json(需 auth_mode=chatgpt + access/refresh token)".to_owned(),
         );
     }
+    // [MOC-257 review] 拒绝把**模拟(合成)账号**导入为真实账号镜像 —— 合成文件也是 auth_mode=chatgpt +
+    // 满 token,parse_chatgpt_auth 不排除它;若导入会用合成覆盖真镜像、Real 模式日后再也恢复不回真账号。
+    if value.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+        return Err("不能把模拟(合成)账号导入为真实账号".to_owned());
+    }
     // [connector review] 导入**不刷新** token;先按本地 JWT exp 判过期 —— 过期则**拒绝导入、
     // 不激活**(不让过期账号覆盖当前可用活动 + 镜像;否则 import_locked 已写活动,reconcile 之后
     // 还会从过期镜像恢复,等于默默激活了死账号)。有效 token 才落盘激活。
@@ -707,8 +721,26 @@ pub async fn pin_current_account() -> Result<(), String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     let located = locate_chatgpt_auth(&paths).ok_or("未检测到可钉住的真实 chatgpt 账号")?;
+    // [MOC-257 review] 模拟(合成)账号态下别把合成账号钉成真实镜像(locate 经 parse_chatgpt_auth 不排除
+    // 合成)—— 否则合成覆盖真镜像、Real 模式恢复不回真账号。要求先切真实账号 / 登录。
+    if located.value.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+        return Err("当前是模拟(合成)账号,无法钉为真实账号;请先登录真实账号".to_owned());
+    }
     // pin 钉的是 Official 活动账号(源即 ~/.codex,reconcile 已优先读 Official)→ 无外部源,
     // 传 None(纯快照保留 + 清掉旧 source 记录),避免 reconcile 误从 ~/.codex 绕一圈重读。
+    import_locked(&paths, &located.value, None)
+}
+
+/// [MOC-257 review] [`pin_current_account`] 的**同步版**,供 `codex login` 的 reap 线程(plain `std::thread`,
+/// 非 async runtime 线程 → `blocking_lock` 安全)在登录成功后**立即**钉账号进镜像。不能只靠前端轮询 pin ——
+/// 页面关 / app 退出来不及看到 `succeeded` 时账号就没进 mirror、退出 restore 重放登录前快照会抹掉它。
+pub fn pin_current_account_blocking() -> Result<(), String> {
+    let _guard = AUTH_LOCK.blocking_lock();
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    let located = locate_chatgpt_auth(&paths).ok_or("未检测到可钉住的真实 chatgpt 账号")?;
+    if located.value.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+        return Err("当前是模拟(合成)账号,无法钉为真实账号;请先登录真实账号".to_owned());
+    }
     import_locked(&paths, &located.value, None)
 }
 
@@ -745,48 +777,64 @@ pub async fn forget_imported() -> Result<bool, String> {
 /// 优先用活动现存 tokens(清除切 apikey 后 tokens 仍在 → 只需改 auth_mode + 删 apikey key);
 /// 活动无有效 token 则从持久镜像恢复整份。先备份再写。持 `AUTH_LOCK`。返回是否成功激活
 /// (有可用 token);无可用 token → `Ok(false)`(caller 提示重登)。
+/// [MOC-257 review] 把可用真账号 Value 规整成 relay 要求的 chatgpt 形态(`auth_mode=chatgpt` + 去
+/// `OPENAI_API_KEY`)。活动/源/镜像可能是 apikey-with-tokens(Codex 切过 apikey 但留 tokens),写活动前统一,
+/// 否则 relay gate(`active_is_real_chatgpt_now` 要 auth_mode=chatgpt)会拒绝实则可用的账号。
+fn normalize_real_auth_to_chatgpt(v: &mut Value) {
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("auth_mode".into(), Value::String("chatgpt".into()));
+        obj.remove("OPENAI_API_KEY");
+    }
+}
+
 pub async fn activate_real_account() -> Result<bool, String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    // 已是真实 chatgpt → no-op 成功。
-    if active_is_real_chatgpt(&paths) {
+    // [MOC-257 review] 「保留活动」两个分支都用 `auth_value_real_and_usable`(非合成 + 非空 + 未撤销 +
+    // **未过期**)统一判定,不再用 `active_is_real_chatgpt`(它经 `parse_chatgpt_auth` 既接受合成、又
+    // 不查过期 → 合成会被当真账号 no-op + 把合成 token 发真 chatgpt.com 全 401;过期残留也会 no-op、
+    // 忽略下面可用的镜像/活源 → 同样 401)。不可用(合成/过期/撤销)则 fall through 到镜像 / 活源恢复。
+    let active = read_auth(&paths.auth_json).ok();
+    // 活动已是 `auth_mode=chatgpt` 的**可用**真账号 → no-op 成功。
+    if active.as_ref().is_some_and(|v| {
+        v.get("auth_mode").and_then(Value::as_str) == Some("chatgpt")
+            && auth_value_real_and_usable(v)
+    }) {
         return Ok(true);
     }
-    // 活动有有效 chatgpt tokens(但 auth_mode 非 chatgpt,如清除后的 apikey)→ 只改 auth_mode。
-    // [codex-review P2] 必须连本地 JWT 过期一起判 —— parse_chatgpt_tokens 只校验非空,清除后保留的
-    // token 会随时间过期;不检查会激活 expired token + 报 Ok(true),前端显示「已开启」但 runtime 全
-    // 401,还会 shadow 掉下面可能有效的镜像(本分支 early-return 在镜像分支前)。过期则 fall through
-    // 到镜像分支(下面会判过期再决定是否恢复)。
-    if let Ok(mut v) = read_auth(&paths.auth_json) {
-        if parse_chatgpt_tokens(&v).is_some() {
-            let access = v
-                .get("tokens")
-                .and_then(|t| t.get("access_token"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !access_token_expired(access, chrono::Utc::now().timestamp()) {
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("auth_mode".into(), Value::String("chatgpt".into()));
-                    obj.remove("OPENAI_API_KEY");
-                }
-                backup_active_auth(&paths, "preactivate")?;
-                write_auth(&paths.auth_json, &v).map_err(|e| format!("写回 chatgpt 失败: {e}"))?;
-                return Ok(true);
-            }
-        }
-    }
-    // 活动无 token → 从持久镜像恢复整份(镜像有效且本地 JWT 未过期)。
-    if let Some(v) = read_imported_mirror(&paths) {
-        let access = v
-            .get("tokens")
-            .and_then(|t| t.get("access_token"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !access.is_empty() && !access_token_expired(access, chrono::Utc::now().timestamp()) {
+    // 活动有可用真 tokens 但 auth_mode 非 chatgpt(如清除后的 apikey-with-tokens)→ 只改 auth_mode。
+    if let Some(mut v) = active {
+        if auth_value_real_and_usable(&v) {
+            normalize_real_auth_to_chatgpt(&mut v);
             backup_active_auth(&paths, "preactivate")?;
-            write_auth(&paths.auth_json, &v).map_err(|e| format!("从镜像恢复失败: {e}"))?;
+            write_auth(&paths.auth_json, &v).map_err(|e| format!("写回 chatgpt 失败: {e}"))?;
             return Ok(true);
         }
+    }
+    // 活动无可用真 token / 是合成 → 从导入账号恢复。[MOC-257 review] **活源优先**(最新、跟随那边 Codex
+    // 刷新),再回落镜像快照;两者都用 `auth_value_real_and_usable`(含**撤销**指纹判定,非裸过期)——
+    // 否则「镜像 token 未过期但已被服务端 401 撤销、活源已刷新」时会写撤销镜像、永不到活源 → 401。对齐
+    // reconcile_on_startup 的「活源 → 镜像」顺序。
+    if let Some(mut v) = read_imported_source_path(&paths)
+        .and_then(|sp| std::fs::read_to_string(&sp).ok())
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .filter(|v| auth_value_real_and_usable(v))
+    {
+        // [MOC-257 review] 源可能 auth_mode=apikey-with-tokens(源 Codex 切了 apikey 但留 tokens)→ 规整成
+        // chatgpt,否则下面 relay gate 拒绝可用账号。同 active-file 分支。
+        normalize_real_auth_to_chatgpt(&mut v);
+        backup_active_auth(&paths, "preactivate")?;
+        write_auth(&paths.auth_json, &v).map_err(|e| format!("从导入活源恢复失败: {e}"))?;
+        return Ok(true);
+    }
+    // [MOC-257 review] 读 raw + normalize:auth_mode=apikey 但带可用 chatgpt tokens 的镜像也能恢复(与
+    // real_account_usable 一致,否则它判可用、这里却 read_imported_mirror chatgpt-filter 漏掉 → real apply 失败)。
+    if let Some(mut v) = read_imported_mirror_raw(&paths).filter(|v| auth_value_real_and_usable(v))
+    {
+        normalize_real_auth_to_chatgpt(&mut v);
+        backup_active_auth(&paths, "preactivate")?;
+        write_auth(&paths.auth_json, &v).map_err(|e| format!("从镜像恢复失败: {e}"))?;
+        return Ok(true);
     }
     Ok(false)
 }
@@ -812,6 +860,525 @@ pub async fn deactivate_real_account() -> Result<bool, String> {
     backup_active_auth(&paths, "predeactivate")?;
     write_auth(&paths.auth_json, &v).map_err(|e| format!("切 apikey 失败: {e}"))?;
     Ok(true)
+}
+
+// ── [MOC-257] 模拟(伪造)账号:合成合规 auth.json + 开关 ────────────────────────
+//
+// 无真实 ChatGPT 账号时的「强制解锁」新实现:不再靠 CDP 改渲染层 authMethod(只改 UI、auth.json
+// 仍 apikey → 通信层不自洽,插件跑不通),而是写一份**合规但伪造**的 auth.json(auth_mode=chatgpt
+// + 合成 JWT),让 Codex 原生走 chatgpt 路径(原生显示 Plugins、CLI 原生发 `/backend-api/*`);这些
+// 账号/插件请求由 proxy 截断逐条伪造 200(见 `codex_app_transfer_proxy::fake_account`),不透传真
+// chatgpt.com(伪造 token 会被上游 401)。relay 装配(`active_is_real_chatgpt_now` → 写
+// `chatgpt_base_url`→proxy)整套复用,无需新增 managed key。
+
+/// 模拟账号的固定哨兵 account_id —— detect / 前端据此区分「伪造」vs「真实」账号。
+pub const SYNTHETIC_ACCOUNT_ID: &str = "cas-synthetic-0000-0000-0000-000000000000";
+
+/// 活动 auth.json 是否是模拟(伪造)账号 —— 顶层 `cas_synthetic==true` 哨兵。home 解析失败 → false。只读。
+pub fn active_is_synthetic() -> bool {
+    CodexPaths::from_home_env()
+        .ok()
+        .and_then(|p| read_auth(&p.auth_json).ok())
+        .and_then(|v| v.get("cas_synthetic").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// 合成 JWT(`base64url(header).base64url(payload).<占位签名>`)。resolver 只验形状不验签
+/// (`crates/proxy/src/resolver.rs::is_chatgpt_access_token`),故占位签名足够;`exp` 由 caller
+/// 放进 payload(远未来),让本地 JWT exp 判定不过期、且 Codex CLI 不触发 refresh。
+fn synth_jwt(payload: &Value) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap_or_default());
+    format!("{header}.{body}.cas-synthetic-sig")
+}
+
+/// 构造一份合规但伪造的 chatgpt `auth.json`。`exp` 设远未来(10 年)杜绝 Codex CLI 触发 token
+/// 刷新(假 refresh_token 刷新必失败);带 `cas_synthetic` 哨兵供识别。
+fn build_synthetic_auth() -> Value {
+    let now = chrono::Utc::now();
+    let exp = now.timestamp() + 10 * 365 * 86400;
+    let access = synth_jwt(&serde_json::json!({
+        "https://api.openai.com/auth": { "chatgpt_account_id": SYNTHETIC_ACCOUNT_ID },
+        "iss": "https://auth.openai.com",
+        "exp": exp,
+    }));
+    let id_token = synth_jwt(&serde_json::json!({
+        "https://api.openai.com/profile": { "email": "plugins@local.codex-app-transfer" },
+        "email": "plugins@local.codex-app-transfer",
+        "exp": exp,
+    }));
+    serde_json::json!({
+        "OPENAI_API_KEY": null,
+        "auth_mode": "chatgpt",
+        "cas_synthetic": true,
+        "last_refresh": now.to_rfc3339(),
+        "tokens": {
+            "id_token": id_token,
+            "access_token": access,
+            "refresh_token": "cas-synthetic-refresh-token",
+            "account_id": SYNTHETIC_ACCOUNT_ID,
+        }
+    })
+}
+
+/// [MOC-257] 开模拟账号模式:把活动 auth.json 写成合成伪造账号(先备份)。幂等:活动已是合成
+/// 账号则 no-op(不每次 churn auth.json + 触发 Codex 重读)。持 `AUTH_LOCK`。caller 随后 apply
+/// relay(写 `chatgpt_base_url`→proxy)。
+///
+/// **防误伤**:活动有**真实 chatgpt tokens**(无哨兵)→ 拒绝,不覆盖真账号(应改用真实账号模式)。
+/// [MOC-257 bot P1] 用 `parse_chatgpt_tokens`(只看 tokens 非空、**不看 auth_mode**)判定,而非
+/// `parse_chatgpt_auth`(要 auth_mode==chatgpt):用户关真实账号模式后,活动是 `auth_mode=apikey` 但
+/// **保留真 tokens**(MOC-178 设计,供退出 restore 恢复);若只判 auth_mode==chatgpt 会漏判这种态、
+/// 合成写覆盖掉唯一一份可恢复的真 tokens(disable 又不自动 restore 备份)→ 用户丢真账号。
+pub async fn activate_fake_account() -> Result<(), String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    if let Ok(v) = read_auth(&paths.auth_json) {
+        if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+            // 我们自己的合成账号。**完整**(auth_mode==chatgpt)才 no-op;[MOC-257 真机] 哨兵在但
+            // auth_mode 被改残(如被另一个非 fake-aware build 的 reconcile 切成 apikey)→ fall through
+            // 重写干净合成账号自愈(否则 Codex auth_mode=apikey 不显示 plugins、relay gate 也不过)。
+            if v.get("auth_mode").and_then(Value::as_str) == Some("chatgpt") {
+                return Ok(());
+            }
+        } else if parse_chatgpt_tokens(&v).is_some() {
+            // 非合成 + 有真实 chatgpt tokens(无哨兵,含「已切 apikey 但保留 tokens」态)→ 拒绝覆盖。
+            return Err(
+                "检测到 ChatGPT 登录态(tokens),模拟账号会覆盖它;请改用「真实账号模式」,或先在真实账号面板彻底清除"
+                    .to_owned(),
+            );
+        }
+    }
+    backup_active_auth(&paths, "prefake")?;
+    write_auth(&paths.auth_json, &build_synthetic_auth())
+        .map_err(|e| format!("写合成 auth.json 失败: {e}"))?;
+    Ok(())
+}
+
+// ── [MOC-257 三态] 插件解锁三态(off / synthetic / real)+ 真账号 stash ──────────────
+//
+// 三态选择器统一 off / 模拟账号 / 真实账号,取代旧 autoUnlockCodexPlugins(CDP,已废弃)+
+// fakeAccountModeEnabled + realAccountModeEnabled。非 off 一律写 chatgpt_base_url(不按账号类型
+// gate)。off 持久化:把真账号 auth.json **整文件** stash 走,退出/切回 real 时整文件还原 ——
+// 因现有快照 restore 只补 auth.json 的 managed key(auth_mode/OPENAI_API_KEY)、**不恢复 tokens**,
+// 直接移走真账号会丢 tokens,故用专用 stash 保全。
+
+/// 三态枚举。`resolve_plugin_unlock_mode` 由持久键 + 真账号检测推导。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginUnlockMode {
+    Off,
+    Synthetic,
+    Real,
+}
+
+/// 真账号「被位移暂存区」:synthetic/off 占用活动 auth.json 时,把真账号整文件移到这里(保 tokens),
+/// 切回 real / 退出 / 启动 self-heal 前整文件还原。`~/.codex` 之外,不被 Codex 改、不被快照轮转。
+fn real_account_stash_path(paths: &CodexPaths) -> PathBuf {
+    paths
+        .app_home
+        .join("plugin-unlock")
+        .join("stashed-real-auth.json")
+}
+
+/// stash 是否存在(暂存着一份被位移的真账号)。只读。
+pub fn real_account_stash_exists() -> bool {
+    CodexPaths::from_home_env()
+        .map(|p| real_account_stash_path(&p).is_file())
+        .unwrap_or(false)
+}
+
+/// 是否「本地有真账号可用」:活动 auth.json 有真实 chatgpt tokens(非合成),或 stash 里存着真账号。
+/// 供三态默认推导(键缺失 → 有真账号则 real、否则 synthetic)。只读。
+pub fn has_real_account() -> bool {
+    let Ok(paths) = CodexPaths::from_home_env() else {
+        return false;
+    };
+    let is_real = |v: &Value| {
+        v.get("cas_synthetic").and_then(Value::as_bool) != Some(true)
+            && parse_chatgpt_tokens(v).is_some()
+    };
+    let active_real = read_auth(&paths.auth_json)
+        .ok()
+        .is_some_and(|v| is_real(&v));
+    // [MOC-257 review] 也认导入/钉住的镜像 + 导入活源(source_path 还在 + 可读):活动被删 / 换成 apikey
+    // 时,真账号只在镜像或活源里(import/pin 过、reconcile 会从它恢复)。否则这些老用户 set(real) 被拒、
+    // 默认推导降级 synthetic。
+    // [MOC-257 review] 读镜像 **raw**(非 read_imported_mirror 的 chatgpt-only filter):auth_mode=apikey 但带可用
+    // chatgpt tokens 的镜像 activate 能 normalize 恢复 → has_real_account 也认它,否则 set(real) 在 has_real_account
+    // 早返 needsLogin 挡住 Real(set handler 先调 has_real_account 再 real_account_usable/activate)。
+    let mirror_real = read_imported_mirror_raw(&paths).is_some_and(|v| is_real(&v));
+    let source_real = read_imported_source_path(&paths)
+        .and_then(|sp| std::fs::read_to_string(&sp).ok())
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .is_some_and(|v| is_real(&v));
+    active_real || mirror_real || source_real || real_account_stash_exists()
+}
+
+/// [MOC-257 review] 一个 auth.json `Value` 是否是**当前可用的真实** chatgpt 账号:非合成、access/refresh
+/// 非空、不是被服务端 401 撤销的那个 token(指纹比对)、且 access_token 本地 JWT 未过期。只读、无副作用。
+/// 供 `real_account_usable`(降级判定)+ `restore_stashed_real_auth_impl`(活动是否比 stash 新/好)复用。
+fn auth_value_real_and_usable(v: &Value) -> bool {
+    if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    if parse_chatgpt_tokens(v).is_none() {
+        return false;
+    }
+    // 就是被服务端 401 撤销的那个 token → 不可用(token 已换 → 指纹不同 → 放行)。
+    let revoked_fp = REVOKED_TOKEN_FP.load(Ordering::SeqCst);
+    let has_revocation = HAS_REVOCATION.load(Ordering::SeqCst);
+    if has_revocation && revoked_fp != 0 && access_token_fingerprint(v) == revoked_fp {
+        return false;
+    }
+    let access = v
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    !access_token_expired(access, chrono::Utc::now().timestamp())
+}
+
+/// [MOC-257] 真账号当前是否**实际可用**(供「real 档不可用则降级 synthetic」+ 前端展示)。可用 = 活动 /
+/// 导入活源 / 导入镜像 / stash 任一有可用真账号(`auth_value_real_and_usable`)。
+///
+/// [MOC-257 review] **不**盲目早返 `relogin_required()`(进程级粘滞标记)—— app 外重登换新 token 后标记
+/// 一时未清会误降级;改逐源直接判(过期 + 撤销指纹)。真正清标记由 `detect()` 的指纹自愈做(这里只读)。
+pub fn real_account_usable() -> bool {
+    let Ok(paths) = CodexPaths::from_home_env() else {
+        return false;
+    };
+    // 有撤销但指纹未知(proxy 算不出被撤 token 指纹)→ 保守判全部不可用(对齐 detect「有撤销但指纹未知
+    // 就保持 relogin」,见 `mark_relogin_required_from_proxy` 注释)。
+    if HAS_REVOCATION.load(Ordering::SeqCst) && REVOKED_TOKEN_FP.load(Ordering::SeqCst) == 0 {
+        return false;
+    }
+    if read_auth(&paths.auth_json)
+        .ok()
+        .is_some_and(|v| auth_value_real_and_usable(&v))
+    {
+        return true;
+    }
+    // [MOC-257 review] 导入活源(source_path 还在 + 可读 + chatgpt + 可用)——对齐 reconcile_on_startup:
+    // 镜像快照过期但活源已被那边 Codex 刷新时不误降级(否则 degrade 后 real-only 的 reconcile 不跑、活源
+    // 永不被恢复)。
+    if read_imported_source_path(&paths)
+        .and_then(|sp| std::fs::read_to_string(&sp).ok())
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .is_some_and(|v| auth_value_real_and_usable(&v))
+    {
+        return true;
+    }
+    // 导入/钉住的镜像也算(未过期才算可用)。[MOC-257 review] 读 **raw**:auth_mode=apikey 但带可用 chatgpt
+    // tokens 的镜像 activate 能 normalize 恢复 → 这里也认它可用,避免误降级 synthetic(与 activate 镜像分支一致)。
+    if read_imported_mirror_raw(&paths).is_some_and(|v| auth_value_real_and_usable(&v)) {
+        return true;
+    }
+    read_auth(&real_account_stash_path(&paths))
+        .ok()
+        .is_some_and(|v| auth_value_real_and_usable(&v))
+}
+
+/// 解析当前**生效**三态:持久键优先;键缺失 → 按可用真账号推导。
+/// [MOC-257] **real 档失效降级**:持久 real 但账号**实际不可用**(过期/服务端撤销)→ 降级 Synthetic
+/// (用户要求);持久仍 real,账号恢复可用(重登)后下次 resolve 自动升回 real。键缺失同理(有可用
+/// 真账号→Real、否则→Synthetic)。只读。
+pub fn resolve_plugin_unlock_mode() -> PluginUnlockMode {
+    match crate::admin::handlers::settings::read_plugin_unlock_mode().as_deref() {
+        Some("off") => PluginUnlockMode::Off,
+        Some("synthetic") => PluginUnlockMode::Synthetic,
+        // real(显式)+ 键缺失(默认):都按「可用真账号→Real,否则降级 Synthetic」。
+        _ => {
+            if real_account_usable() {
+                PluginUnlockMode::Real
+            } else {
+                PluginUnlockMode::Synthetic
+            }
+        }
+    }
+}
+
+/// [MOC-257 review] 最近一次**成功 apply** 的生效三态。0=未 apply 过 / 1=off / 2=synthetic / 3=real。
+/// 供 status 如实报告「**当前实际生效**」而非 `resolve_plugin_unlock_mode` 的「意图/推导」:外部
+/// `codex login` 等会让 resolve 升级(synthetic→real),但在下次 apply 前 proxy 伪造态仍是旧的 ——
+/// 报 resolve 会让 UI 显示 Real 却仍在 fabricate /backend-api。`apply_plugin_unlock_mode` 成功后写。
+static LAST_APPLIED_MODE: AtomicU8 = AtomicU8::new(0);
+
+/// `apply_plugin_unlock_mode` 成功后调:记录最近成功生效的三态。
+pub fn record_applied_mode(mode: PluginUnlockMode) {
+    let v = match mode {
+        PluginUnlockMode::Off => 1,
+        PluginUnlockMode::Synthetic => 2,
+        PluginUnlockMode::Real => 3,
+    };
+    LAST_APPLIED_MODE.store(v, Ordering::SeqCst);
+}
+
+/// [MOC-257 review] 清「最近生效」标记 → 未 apply 态。手动「还原 Codex 原配置」(desktop_clear/restore)
+/// 移除了合成/真 auth + relay,生效态已不是任何解锁档 → 重置,否则 status 报陈旧档、前端 no-op 点不动。
+pub fn reset_applied_mode() {
+    LAST_APPLIED_MODE.store(0, Ordering::SeqCst);
+}
+
+/// 最近成功 apply 的生效模式;还没 apply 过(启动前)→ `None`(caller 回退 `resolve`)。
+pub fn last_applied_mode() -> Option<PluginUnlockMode> {
+    match LAST_APPLIED_MODE.load(Ordering::SeqCst) {
+        1 => Some(PluginUnlockMode::Off),
+        2 => Some(PluginUnlockMode::Synthetic),
+        3 => Some(PluginUnlockMode::Real),
+        _ => None,
+    }
+}
+
+/// [MOC-257 review] 把 `path`(若存在)改名归档到 `<app_home>/real-account/discarded-stash-<ns>.json`,
+/// 覆盖前留可恢复副本(**不直删** —— 可能是不同真账号,直删 = 丢账号,违反「覆盖前必备份」不变量)。
+/// 返回归档后 `path` 是否**已不存在**(`true` = 已移走 / 本就不存在 → 可安全覆盖;`false` = 归档失败、
+/// 文件仍在 → caller **不应**覆盖以免丢账号)。
+#[must_use]
+fn archive_existing_auth_file(paths: &CodexPaths, path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return true; // 本就不存在
+    }
+    let archive_dir = paths.app_home.join("real-account");
+    if let Err(e) = std::fs::create_dir_all(&archive_dir) {
+        tracing::warn!("[PluginUnlock] 建归档目录失败(保留旧文件不直删): {e}");
+        return false;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let archived = archive_dir.join(format!("discarded-stash-{ts}.json"));
+    match std::fs::rename(path, &archived) {
+        Ok(()) => {
+            // [MOC-257 review] rename 保留源权限,归档的真账号 auth 文件强制 0600(同其它 stash/auth 写点)。
+            set_auth_file_private(&archived);
+            true
+        }
+        Err(e) => {
+            tracing::warn!("[PluginUnlock] 归档旧 auth 文件失败(保留不直删): {e}");
+            false
+        }
+    }
+}
+
+/// [MOC-257 review] 读活动 `auth.json` 原始字节快照,供 apply 失败**事务回滚**(保留原 tokens + gateway
+/// key + 全部字段,不像 `deactivate_real_account` 只翻 `auth_mode` 会丢 `OPENAI_API_KEY`)。只读。
+/// **fallible + 区分**:文件不存在 → `Ok(None)`(回滚时删活动 = 还原到无 auth);存在但**读失败**(权限/锁)
+/// → `Err`,caller 必须 abort 切换 —— 否则错误地拿 `None` 当「apply 前无 auth」,回滚 `restore_active_auth_bytes(None)`
+/// 会把这份**不可读但存在**的真账号删掉丢凭据。
+pub fn snapshot_active_auth_bytes() -> Result<Option<Vec<u8>>, String> {
+    let p = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    match std::fs::read(&p.auth_json) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "读活动 auth.json 字节失败(文件存在但不可读),已中止切换以免回滚误删: {e}"
+        )),
+    }
+}
+
+/// [MOC-257 review] 把当前活动 `auth.json` 整文件 rename **回 stash**(undo `restore_stashed`),供 Real apply 在
+/// unstash 后、activate 前的**读字节失败**回滚:无需读字节即可把真账号放回 stash、再还原 pre_apply,保状态一致
+/// (persisted 回滚 + active=pre_apply + 真账号在 stash)且不丢账号。活动不存在 / rename 失败 → `false`(best-effort)。
+pub fn move_active_to_stash_raw() -> bool {
+    let Ok(p) = CodexPaths::from_home_env() else {
+        return false;
+    };
+    if !p.auth_json.exists() {
+        return false;
+    }
+    let stash = real_account_stash_path(&p);
+    if let Some(parent) = stash.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if stash.exists() {
+        let _ = archive_existing_auth_file(&p, &stash); // 防御:理论上 restore_stashed 已消费 stash
+    }
+    std::fs::rename(&p.auth_json, &stash).is_ok()
+}
+
+/// [MOC-257 review] 把 auth 文件设 0600(Unix)。`std::fs::write` 默认 `0666 & umask`,多用户共享 home + umask
+/// 022 时其它本地用户能读到 chatgpt refresh token / gateway key。`write_auth` 一直强制 0600,这里对齐 ——
+/// 用裸 `std::fs::write` 写 auth/stash 字节后必调。best-effort(设权限失败只忽略,内容已落盘)。
+fn set_auth_file_private(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// [MOC-257 review] 把字节写回 stash 路径(apply 回滚:Real 分支若是从 stash unstash 了真账号才失败,需
+/// 把真账号放回 stash,恢复 pre-apply 的「真账号在 stash」态)。`None`(本次没 unstash)→ `Ok(())` no-op。
+/// **fallible**:写失败必须报 —— 此时原 stash 已被 unstash 消费、内存 Vec 是真账号唯一副本,caller 据 Err
+/// **别再覆盖活动**(真账号还在活动里),否则真 tokens 永久丢。
+#[must_use = "re-stash 可能失败;失败时别覆盖活动(真账号唯一副本在活动里),否则丢账号"]
+pub fn restash_real_auth_bytes(snapshot: Option<Vec<u8>>) -> Result<(), String> {
+    let Some(bytes) = snapshot else {
+        return Ok(()); // 本次没 unstash → 无需 re-stash
+    };
+    let p = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    let stash = real_account_stash_path(&p);
+    if let Some(parent) = stash.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建 stash 目录失败: {e}"))?;
+    }
+    std::fs::write(&stash, &bytes).map_err(|e| format!("写 stash 失败: {e}"))?;
+    set_auth_file_private(&stash); // 真账号整文件含 refresh token → 0600
+    Ok(())
+}
+
+/// 把活动 `auth.json` 还原到 [`snapshot_active_auth_bytes`] 拿的快照(`Some`→写回原字节;`None`→删文件,
+/// 还原到「apply 前无 auth.json」)。供 apply 失败回滚。[MOC-257 review] **fallible**:写/删失败(~/.codex 锁/
+/// 不可写)caller 要 surface,否则回滚不全(活动留错的 auth)却仍报 persisted 回滚成功 → Off/Synthetic 报上去
+/// 但 Codex 拿错账号。
+#[must_use = "回滚还原活动 auth 可能失败;失败要 surface 给 caller,别静默吞"]
+pub fn restore_active_auth_bytes(snapshot: Option<Vec<u8>>) -> Result<(), String> {
+    let p = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    let r = match &snapshot {
+        Some(bytes) => std::fs::write(&p.auth_json, bytes),
+        None => match std::fs::remove_file(&p.auth_json) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+    };
+    r.map_err(|e| {
+        tracing::warn!("[PluginUnlock] apply 失败回滚 auth.json 快照失败: {e}");
+        format!("还原活动 auth 失败: {e}")
+    })?;
+    if snapshot.is_some() {
+        set_auth_file_private(&p.auth_json); // 写回的快照可能含 chatgpt token / gateway key → 0600
+    }
+    Ok(())
+}
+
+/// 把活动**真账号**整文件移到 stash 保全(保 tokens),供切到 synthetic/off 前调用。**只动真账号**
+/// (有 chatgpt tokens、非合成);合成账号 / apikey / 无 auth.json → 留着不动(各自由 `activate_fake_account`
+/// 覆盖、`clear_active_auth_file`(off)清、或本就空)。持 `AUTH_LOCK`。
+/// 返回**本次是否真把一个真账号移进了 stash**(`true`)——供 caller(synthetic 回滚)判断是否该 un-stash:
+/// 已是合成 / apikey / 无文件 / 或「已有可用 stash 仅归档过期残留」都返 `false`(本次没 displace)。
+pub async fn stash_displaced_real_auth() -> Result<bool, String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    // [MOC-257 review] read_auth 对**不存在 / 空**返 Ok({})(→ 下面 parse_chatgpt_tokens None 返 Ok(false));
+    // Err = 文件**存在但读/解析失败**(权限/锁/损坏 JSON)→ **绝不返 Ok(false) 当「无账号」继续**(OFF 接着
+    // clear_active_auth_file / synthetic activate 覆写会删掉这份不可读的真账号丢凭据)→ abort 切换。
+    let v = match read_auth(&paths.auth_json) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(format!(
+                "活动 auth.json 存在但读取/解析失败,已中止切换以免误删真账号(请检查 ~/.codex/auth.json): {e}"
+            ));
+        }
+    };
+    if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+        return Ok(false); // 合成账号 → 不动(synthetic 的 activate no-op / off 的 clear 各自处理)
+    }
+    if parse_chatgpt_tokens(&v).is_none() {
+        return Ok(false); // apikey 无真 tokens → 不进 stash(off 会清 / synthetic 会覆盖)
+    }
+    // 真账号 → 整文件移到 stash 保全。
+    let stash = real_account_stash_path(&paths);
+    // [MOC-257 review] 已有**可用** stash、而活动只是**过期/撤销的**真账号残留(app 外 login 写进来的死
+    // token)→ **不**用活动覆盖:否则把有效 stash 归档掉、`real_account_usable` / Real activation 只读
+    // `stashed-real-auth.json` 见过期 → 误降级 synthetic。保留可用 stash;活动残留交给 caller(synthetic
+    // 的 activate 覆盖 / off 的 clear)处理。
+    if read_auth(&stash)
+        .ok()
+        .is_some_and(|s| auth_value_real_and_usable(&s))
+        && !auth_value_real_and_usable(&v)
+    {
+        // [MOC-257 review] 保留可用 stash;但把过期/撤销的活动残留**归档移走**(不留 ~/.codex)—— 否则后续
+        // synthetic 的 `activate_fake_account` 守护会拒绝这个带 chatgpt token 的非合成文件 → synthetic apply
+        // 失败;off 的 clear 也省一步。归档失败不阻断(活动留着、stash 仍保住、下次重试)。
+        let _ = archive_existing_auth_file(&paths, &paths.auth_json);
+        return Ok(false); // 保留已有可用 stash、只归档过期残留 → **本次没 displace 账号**(回滚别 un-stash)
+    }
+    if let Some(parent) = stash.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建 stash 目录失败: {e}"))?;
+    }
+    // [MOC-257 review] stash 已存在另一真账号(A 已 stash → app 外 login B 成活动 → 再 stash B)→ 先归档
+    // 旧 stash 再覆盖,否则 rename 直接顶掉 A 丢账号(macOS/Linux rename 静默替换);也兼顾 Windows
+    // (rename 目标存在会失败)。**归档失败(旧 stash 仍在)→ 中止**,绝不 rename 覆盖丢掉账号 A。
+    if !archive_existing_auth_file(&paths, &stash) {
+        return Err(
+            "旧 stash 归档失败,已中止以免覆盖丢账号;请检查 ~/.codex-app-transfer 目录权限后重试"
+                .to_owned(),
+        );
+    }
+    std::fs::rename(&paths.auth_json, &stash).map_err(|e| format!("移真账号到 stash 失败: {e}"))?;
+    // [MOC-257 review] rename 保留源文件权限,活动 auth.json 若是外部(Codex CLI 等)以 0644 创建 → stash 也
+    // 0644、refresh token 在共享 home 下其它本地用户可读。同回滚 helper 强制 0600。
+    set_auth_file_private(&stash);
+    Ok(true) // 真把一个真账号移进了 stash → 回滚时该 un-stash 还原
+}
+
+/// [MOC-257 三态 OFF] 清掉活动 `~/.codex/auth.json`(确保 .codex 无 auth.json)。真账号应已先经
+/// `stash_displaced_real_auth` 移走;这里删剩下的合成 / apikey 残留。无文件 → no-op。持 `AUTH_LOCK`。
+pub async fn clear_active_auth_file() -> Result<(), String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    if paths.auth_json.is_file() {
+        std::fs::remove_file(&paths.auth_json)
+            .map_err(|e| format!("删活动 auth.json 失败: {e}"))?;
+    }
+    Ok(())
+}
+
+/// 从 stash 整文件还原真账号到 `~/.codex/auth.json`(纯文件逻辑,**无锁**,供 sync/async 复用)。
+/// stash 不存在 → `Ok(false)`。**活动已是真账号**(app 外新 login、比 stash 更新)→ 把 stash
+/// **改名归档**(不直删:可能是不同账号,直删 = 丢账号,违反「覆盖前必备份」不变量)、不覆盖活动,
+/// 返 `Ok(false)`。否则整文件还原、返 `Ok(true)`。
+fn restore_stashed_real_auth_impl(paths: &CodexPaths) -> Result<bool, String> {
+    let stash = real_account_stash_path(paths);
+    if !stash.is_file() {
+        return Ok(false);
+    }
+    // [MOC-257 review] 活动是否「更新且**可用**的真账号」——必须含过期/撤销判定:活动只是**过期的**真
+    // chatgpt 残留(auth_mode=chatgpt、tokens 在但已过期)时,不能当成「更新真账号」把有效的 stash 归档掉、
+    // 回退到过期 active(切 real 会失败)。用 `auth_value_real_and_usable`(非合成 + 非空 + 未撤销 + 未过期)。
+    // [MOC-257 review] 必须是 **auth_mode=chatgpt** 的可用真账号才算「活动已还原、可跳过 stash」。apikey-with-
+    // tokens(退出/启动/手动 restore 重放的旧快照里 apikey 模式 + 残留 chatgpt tokens)虽 tokens 可用、但 Codex
+    // 不当作 chatgpt(插件不可用)→ 仍要还原 stash 里更新的 chatgpt 登录,否则归档掉 stash、留 apikey 模式。
+    let active_usable = read_auth(&paths.auth_json).ok().is_some_and(|v| {
+        v.get("auth_mode").and_then(Value::as_str) == Some("chatgpt")
+            && auth_value_real_and_usable(&v)
+    });
+    if active_usable {
+        // 活动已是更新且可用的真账号 → 不覆盖;stash 那份也是真账号(含 tokens),改名归档(不直删:
+        // 可能不同账号 → 直删丢账号),留可恢复副本。归档失败这里不阻断:活动 + stash 都保住、下次重试。
+        let _ = archive_existing_auth_file(paths, &stash);
+        return Ok(false);
+    }
+    // 活动非可用真账号(synthetic / apikey / 过期残留)→ 删掉再 rename:Windows `rename` 目标已存在会
+    // 失败(real 还原直接报错、回不去 real);macOS/Linux 虽会替换,显式删保证跨平台一致。被删的是
+    // 占位 / 过期残留(stash 里有更值得保留的),安全。
+    let _ = std::fs::remove_file(&paths.auth_json);
+    std::fs::rename(&stash, &paths.auth_json)
+        .map_err(|e| format!("从 stash 还原真账号失败: {e}"))?;
+    // [MOC-257 review] rename 保留源(stash)权限,确保还原回活动的真账号 auth.json 也 0600(老 stash 可能 0644)。
+    set_auth_file_private(&paths.auth_json);
+    Ok(true)
+}
+
+/// 从 stash 整文件还原真账号(**异步**,持 `AUTH_LOCK`)。供 orchestrator(切到 real)用。
+pub async fn restore_stashed_real_auth() -> Result<bool, String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    restore_stashed_real_auth_impl(&paths)
+}
+
+/// [MOC-257 review] 从 stash 还原真账号的**同步**版(无 `AUTH_LOCK` / 不 `block_on`)。供 Tauri
+/// setup(startup self-heal)/ exit 闭包(非 async 上下文)用 —— exit 时 async runtime 可能正在
+/// shutdown,`block_on` 异步锁会 panic(panic 在 exit 闭包会 abort 进程、跳过紧随的
+/// `restore_codex_if_enabled`);且 exit 进程独占、startup self-heal 在任何 auth task spawn 之前,
+/// 均无并发,无需 AUTH_LOCK。失败由 caller `tracing::error!` 留痕(对齐 restore_codex_if_enabled)。
+pub fn restore_stashed_real_auth_blocking() -> Result<bool, String> {
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    restore_stashed_real_auth_impl(&paths)
 }
 
 /// [MOC-104 req#5 启动调谐] 启动时(**绝不刷新 token**,见模块级分流说明):① 活动
@@ -849,8 +1416,15 @@ pub async fn reconcile_on_startup(mode_enabled: Option<bool>) -> Result<Reconcil
         });
     }
 
-    // 活动已是真实 chatgpt → 共用、绝不动(Codex 自维护这份,transfer 只读跟随、不覆盖)。
-    if active_is_real_chatgpt(&paths) {
+    // 活动已是**可用真实** chatgpt → 共用、绝不动(Codex 自维护这份,transfer 只读跟随、不覆盖)。
+    // [MOC-257 review] 用 `auth_value_real_and_usable`(非合成 + 未过期 + 未撤销)而非 `active_is_real_chatgpt`
+    // (后者经 `parse_chatgpt_auth` 既接受合成、又不查过期):restoreCodexOnExit=false 保留的合成态
+    // (auth_mode=chatgpt 假)会误 pass、返 StillValid、不查 mirror/stash、不发 relogin → persisted=real 用户
+    // (真账号已过期/撤销)被静默降级 synthetic 不提示重登。过期的真残留同理 fall through 去镜像/活源恢复或 relogin。
+    if read_auth(&paths.auth_json)
+        .ok()
+        .is_some_and(|v| auth_value_real_and_usable(&v))
+    {
         return Ok(ReconcileOutcome::StillValid {
             source: AuthSource::Official,
         });
@@ -934,16 +1508,32 @@ pub fn start_login() -> Result<(), String> {
     // 后台线程 reap:wait_with_output 阻塞到 codex login 完成/被杀,记录结果。
     std::thread::spawn(move || {
         let result = child.wait_with_output();
-        let mut g = login_lock();
-        g.running = false;
-        g.pid = None;
-        g.last = match result {
+        // [MOC-257 review] **pin 不在持 LOGIN 锁时做**:pin_current_account_blocking 等 AUTH_LOCK,而
+        // reconcile_on_startup 反序持 AUTH_LOCK 再取 LOGIN(login_status)→ 持 LOGIN 等 AUTH_LOCK 会死锁(快速
+        // 登录撞上 startup reconcile 时 login 轮询 + auth reconcile 双卡死)。故:先读 cancel_requested 后释放
+        // LOGIN,pin 无锁做,算完最终态再重取 LOGIN 发布。
+        let cancel_requested = login_lock().cancel_requested;
+        let new_state = match result {
             Ok(out) if out.status.success() => {
                 clear_relogin_state(); // [MOC-124 H-2] 登录成功 = 拿到新鲜账号,清失效标记 + 撤销指纹
-                LoginState::Succeeded
+                                       // [MOC-257 review] 登录成功后**后端立即 pin** 当前账号进镜像,不依赖前端轮询(页面关 / app 退出
+                                       // 来不及看到 succeeded 时账号没进 mirror、退出 restore 重放登录前快照会抹掉它)。**pin 失败报
+                                       // Failed**(不报 Succeeded):账号没进 mirror、撑不过退出 restore → 让用户(前端在场时)看到错误、
+                                       // 修 ~/.codex-app-transfer 权限后重试,而非静默 Succeeded 让后续应用一个会丢的账号。对齐前端 block。
+                match pin_current_account_blocking() {
+                    Ok(()) => LoginState::Succeeded,
+                    Err(e) => {
+                        tracing::error!(
+                            "[RealAccount] 登录成功但 pin 账号失败,报 Failed 让用户重试: {e}"
+                        );
+                        LoginState::Failed(format!(
+                            "登录成功,但账号持久化失败(请检查 ~/.codex-app-transfer 目录权限后重试): {e}"
+                        ))
+                    }
+                }
             }
             Ok(out) => {
-                if g.cancel_requested {
+                if cancel_requested {
                     LoginState::Cancelled
                 } else {
                     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -956,6 +1546,10 @@ pub fn start_login() -> Result<(), String> {
             }
             Err(e) => LoginState::Failed(format!("等待 codex login 失败: {e}")),
         };
+        let mut g = login_lock();
+        g.running = false;
+        g.pid = None;
+        g.last = new_state;
     });
     Ok(())
 }
@@ -1244,5 +1838,130 @@ mod tests {
             })
             .expect("import 前应备份原活动 auth.json");
         assert_eq!(read_auth(&prebackup).unwrap()["auth_mode"], "apikey");
+    }
+
+    // [MOC-257] 合成伪造 auth.json 必须:① 满足 parse_chatgpt_auth(触发 relay gate)②带 cas_synthetic
+    // 哨兵 ③access_token 远未来不判过期 ④是 3 段 JWT + payload 含 chatgpt_account_id(镜像 proxy
+    // resolver::is_chatgpt_access_token 的放行条件,等价「真配置验证」——合成 token 一定被 proxy 放行)。
+    #[test]
+    fn synthetic_auth_is_wellformed_chatgpt() {
+        use base64::Engine;
+        let v = build_synthetic_auth();
+        assert!(
+            parse_chatgpt_auth(&v).is_some(),
+            "应满足 relay gate 的 chatgpt 判定"
+        );
+        assert_eq!(v.get("cas_synthetic").and_then(Value::as_bool), Some(true));
+        let access = v["tokens"]["access_token"].as_str().unwrap();
+        assert!(
+            !access_token_expired(access, chrono::Utc::now().timestamp()),
+            "远未来 exp 不应判过期(否则 detect 会标 relogin)"
+        );
+        let parts: Vec<&str> = access.split('.').collect();
+        assert_eq!(parts.len(), 3, "access_token 应是 3 段 JWT");
+        assert!(!parts[2].is_empty(), "签名段非空(resolver 形状校验要求)");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .unwrap();
+        let pv: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            pv["https://api.openai.com/auth"]["chatgpt_account_id"].as_str(),
+            Some(SYNTHETIC_ACCOUNT_ID),
+            "payload 必须含非空 chatgpt_account_id(resolver 放行条件)"
+        );
+    }
+
+    // ── [MOC-257] 三态 stash 原语单测 ────────────────────────────────────────
+
+    /// stash 存在 + 活动非真账号(合成/apikey/无)→ 整文件还原到活动、stash 消费。
+    #[test]
+    fn restore_stash_moves_to_active_when_active_not_real() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        write_json(&real_account_stash_path(&paths), &chatgpt_auth());
+        // 活动是合成账号 → 应被 stash 真账号覆盖。
+        write_json(
+            &paths.auth_json,
+            &json!({"auth_mode": "chatgpt", "cas_synthetic": true,
+                    "tokens": {"access_token": "syn", "refresh_token": "syn"}}),
+        );
+        assert!(restore_stashed_real_auth_impl(&paths).unwrap(), "应还原");
+        assert!(!real_account_stash_path(&paths).is_file(), "stash 应消费");
+        let restored = read_auth(&paths.auth_json).unwrap();
+        assert_eq!(
+            restored.get("cas_synthetic"),
+            None,
+            "活动应是真账号(无哨兵)"
+        );
+        assert!(
+            parse_chatgpt_tokens(&restored).is_some(),
+            "活动应有真 tokens"
+        );
+    }
+
+    /// [review 数据安全] 活动已是**更新真账号**(app 外 login)→ 不覆盖;旧 stash **改名归档**
+    /// (不直删,留可恢复副本),返 false。
+    #[test]
+    fn restore_archives_stash_when_active_already_real() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        write_json(&paths.auth_json, &chatgpt_auth()); // 活动真账号(更新)
+        write_json(&real_account_stash_path(&paths), &chatgpt_auth()); // stash 旧真账号
+        assert!(
+            !restore_stashed_real_auth_impl(&paths).unwrap(),
+            "活动已是真账号 → 不还原"
+        );
+        assert!(
+            !real_account_stash_path(&paths).is_file(),
+            "stash 应被移走(归档)"
+        );
+        let archived = std::fs::read_dir(paths.app_home.join("real-account"))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("discarded-stash-")
+            })
+            .count();
+        assert_eq!(archived, 1, "应有一份归档副本(不直删,防丢账号)");
+    }
+
+    /// 无 stash → no-op 返 false。
+    #[test]
+    fn restore_noop_when_no_stash() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        assert!(!restore_stashed_real_auth_impl(&paths).unwrap());
+    }
+
+    /// [review] 活动只是**过期的**真账号残留 → 不当成「更新真账号」归档掉有效 stash,而是还原有效 stash。
+    #[test]
+    fn restore_prefers_stash_when_active_real_is_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        let now = chrono::Utc::now().timestamp();
+        // 活动:过期真 chatgpt 残留(auth_mode=chatgpt、tokens 在但 access 已过期)。
+        write_json(
+            &paths.auth_json,
+            &json!({"auth_mode": "chatgpt",
+                    "tokens": {"access_token": make_jwt_with_exp(now - 3600), "refresh_token": "r1"}}),
+        );
+        // stash:有效真账号(未过期)。
+        write_json(
+            &real_account_stash_path(&paths),
+            &json!({"auth_mode": "chatgpt",
+                    "tokens": {"access_token": make_jwt_with_exp(now + 86400), "refresh_token": "r2"}}),
+        );
+        assert!(
+            restore_stashed_real_auth_impl(&paths).unwrap(),
+            "过期活动残留 → 应还原有效 stash(而非归档掉好 stash)"
+        );
+        assert!(!real_account_stash_path(&paths).is_file(), "stash 应消费");
+        let active = read_auth(&paths.auth_json).unwrap();
+        assert_eq!(
+            active["tokens"]["refresh_token"], "r2",
+            "活动应换成 stash 里的有效账号"
+        );
     }
 }

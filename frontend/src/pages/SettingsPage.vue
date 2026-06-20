@@ -7,12 +7,6 @@ import { useSettingsStore } from '@/stores/settings'
 import type { Settings } from '@/api/settings'
 import { useToast } from '@/composables/useToast'
 import { getAppVersion, checkAppUpdate, openExternalUrl } from '@/api/system'
-import {
-  pluginUnlockStatus,
-  pluginUnlockStart,
-  pluginUnlockReinject,
-  type PluginUnlockState,
-} from '@/api/desktop'
 import SettingsGroup from '@/components/ui/SettingsGroup.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
@@ -21,6 +15,16 @@ import AppSelect from '@/components/ui/AppSelect.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 import { getChromeReady, ensureChrome, getSystemProxyStatus, type SystemProxyStatus } from '@/api/chrome'
+import {
+  getPluginUnlockStatus,
+  setPluginUnlockMode,
+  getRealAccountStatus,
+  startRealAccountLogin,
+  cancelRealAccountLogin,
+  pinCurrentRealAccount,
+  type PluginUnlockMode,
+} from '@/api/desktop'
+import type { ApiError } from '@/api/http'
 import ResidualScanPanel from '@/components/settings/ResidualScanPanel.vue'
 import SnapshotPanel from '@/components/settings/SnapshotPanel.vue'
 import DiagnosticPanel from '@/components/settings/DiagnosticPanel.vue'
@@ -38,7 +42,18 @@ onMounted(() => {
   getAppVersion()
     .then((r) => (appVersion.value = r.version || ''))
     .catch(() => {})
+  refreshPluginUnlockStatus()
 })
+
+// 拉后端三态状态同步两 ref(mount + 「还原 Codex 原配置」后,后端 reset 了 LAST_APPLIED 需重读)。
+function refreshPluginUnlockStatus() {
+  getPluginUnlockStatus()
+    .then((s) => {
+      pluginUnlockMode.value = s.mode // 显示:实际生效(未 apply→null)
+      persistedMode.value = s.persisted // 意图:持久值(降级时仍是 real)
+    })
+    .catch(() => {})
+}
 
 // 关于:检查更新 + 外链(走系统浏览器)
 async function onCheckUpdate() {
@@ -77,7 +92,6 @@ function toggle(key: string, def: boolean) {
 }
 const autoApplyOnStart = toggle('autoApplyOnStart', true)
 const restoreCodexOnExit = toggle('restoreCodexOnExit', true)
-const autoUnlockCodexPlugins = toggle('autoUnlockCodexPlugins', false)
 const autoWakeCodexPet = toggle('autoWakeCodexPet', true)
 const codexQuotaEnabled = toggle('codexQuotaEnabled', false)
 const codexNetworkAccess = toggle('codexNetworkAccess', false)
@@ -88,58 +102,126 @@ const hideDockIcon = toggle('hideDockIcon', false)
 // macOS 限定:隐藏程序坞图标(Windows/Linux 无 Dock 概念,该开关不显示)
 const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.userAgent)
 
-// ── Codex 插件解锁 daemon:开关开启时轮询运行时状态 + 强制开启(手动注入)──
-const unlockState = ref<PluginUnlockState | ''>('')
-const unlockForcing = ref(false)
-const unlockStateLabel = computed(() =>
-  unlockState.value ? t(`settings.pluginUnlockState.${unlockState.value}`) : '',
-)
-let unlockTimer: ReturnType<typeof setInterval> | null = null
-async function refreshUnlockState() {
+// [MOC-257 三态] 插件解锁三态(关闭/模拟账号/真实账号):非普通 settings 键,调专用 set 端点
+// (写/移走 auth.json + apply relay + 驱动 proxy 伪造)。受控:高亮跟服务端,失败回滚 + toast。
+// null = 后端未 apply 过(启动跳过 / 首次)→ SegmentedControl 不高亮,点任一档都触发 apply(否则
+// 高亮某档时再点它 no-op、永远应用不上,见 review)。
+const pluginUnlockMode = ref<PluginUnlockMode | null>(null)
+// [review] 持久**意图**(降级时 displayed=synthetic 但 persisted 仍 real);no-op 判它而非 displayed,
+// 否则降级后点 synthetic(displayed 已是 synthetic)会 no-op、settle 不到 synthetic、账号恢复又被升回 real。
+const persistedMode = ref<PluginUnlockMode | null>(null)
+const pluginUnlockBusy = ref(false)
+const pluginUnlockOptions: { value: PluginUnlockMode; label: string }[] = [
+  { value: 'off', label: t('settings.pluginUnlockOff') },
+  { value: 'synthetic', label: t('settings.pluginUnlockSynthetic') },
+  { value: 'real', label: t('settings.pluginUnlockReal') },
+]
+async function onSetPluginUnlockMode(mode: PluginUnlockMode) {
+  // no-op 只在「持久意图 **且** 当前已生效」都等于点击档时(真没东西可改);否则放行 apply:
+  // ① 降级(persisted=real / displayed=synthetic):点 synthetic 改意图 settle、点 real 重试;
+  // ② 启动跳过 apply(persisted=某档 / displayed=null 未生效):点该档才能真应用上。
+  if (
+    pluginUnlockBusy.value ||
+    (mode === persistedMode.value && mode === pluginUnlockMode.value)
+  )
+    return
+  pluginUnlockBusy.value = true
+  const prevDisplay = pluginUnlockMode.value
+  const prevPersisted = persistedMode.value
+  pluginUnlockMode.value = mode // 乐观更新(显示)
+  persistedMode.value = mode // 乐观更新(意图,后端 persist 的就是 req.mode)
   try {
-    unlockState.value = (await pluginUnlockStatus()).status
-  } catch {
-    unlockState.value = ''
-  }
-}
-function stopUnlockPoll() {
-  if (unlockTimer) {
-    clearInterval(unlockTimer)
-    unlockTimer = null
-  }
-}
-function startUnlockPoll() {
-  stopUnlockPoll()
-  refreshUnlockState()
-  unlockTimer = setInterval(refreshUnlockState, 3000)
-}
-// 开关开 → 轮询;关 → 停轮询并清状态(daemon 已被后端 stop)
-watch(
-  autoUnlockCodexPlugins,
-  (on) => {
-    if (on) startUnlockPoll()
-    else {
-      stopUnlockPoll()
-      unlockState.value = ''
+    const r = await setPluginUnlockMode(mode)
+    if (r?.degraded && r.effective) {
+      // 真账号失效 → 显示跟生效(合成);persistedMode 保持 real(意图),账号恢复可用会自动升回
+      pluginUnlockMode.value = r.effective
+      if (r.message) toast(r.message, 'error')
+    } else if (r?.message) {
+      toast(r.message)
     }
-  },
-  { immediate: true },
-)
-onUnmounted(stopUnlockPoll)
-// 强制开启:先确保 daemon 在跑(/start 幂等),再触发一次注入(/reinject)。
-async function forceUnlock() {
-  unlockForcing.value = true
-  try {
-    await pluginUnlockStart()
-    await pluginUnlockReinject()
-    toast(t('settings.pluginUnlockForced'))
   } catch (e) {
-    toast((e as Error).message || t('settings.pluginUnlockForceFailed'), 'error')
+    pluginUnlockMode.value = prevDisplay // 失败回滚
+    persistedMode.value = prevPersisted
+    const data = (e as ApiError)?.responseData as { needsLogin?: boolean } | undefined
+    if (data?.needsLogin) {
+      loginModalOpen.value = true // real 但本地无账号 → 弹登录提示
+    } else {
+      toast((e as Error).message || t('settings.pluginUnlockFailed'), 'error')
+    }
   } finally {
-    unlockForcing.value = false
-    refreshUnlockState()
+    pluginUnlockBusy.value = false
   }
 }
+
+// [MOC-257] 真账号登录弹窗:选「真实账号」但本地无账号时引导用户 codex login。
+const loginModalOpen = ref(false)
+const loginRunning = ref(false)
+const loginError = ref('')
+let loginPollTimer: number | undefined
+function stopLoginPoll() {
+  if (loginPollTimer) {
+    window.clearInterval(loginPollTimer)
+    loginPollTimer = undefined
+  }
+}
+async function startLogin() {
+  loginError.value = ''
+  loginRunning.value = true
+  try {
+    await startRealAccountLogin()
+  } catch (e) {
+    loginRunning.value = false
+    loginError.value = (e as Error).message
+    return
+  }
+  loginPollTimer = window.setInterval(async () => {
+    try {
+      const s = await getRealAccountStatus()
+      if (s.loginState === 'succeeded') {
+        stopLoginPoll()
+        // [MOC-257 review] 切 real 前先 pin 当前账号到 mirror/stash:否则登录前已有快照(startup auto-apply)
+        // + restoreCodexOnExit 开时,新登录账号没存进 mirror、退出 restore 重放登录前快照抹掉 auth_mode。
+        // pin **失败则 block 切 real**:账号没进 mirror,Real 切了也撑不过退出 restore → 留 modal 显示错误、让
+        // 用户修 ~/.codex-app-transfer 权限后重试,不带不可靠状态切 Real。
+        try {
+          await pinCurrentRealAccount()
+        } catch {
+          loginRunning.value = false
+          loginError.value = t('settings.realAccountPinFailed')
+          return // 保持 modal 打开显示错误,不切 real
+        }
+        loginRunning.value = false
+        loginModalOpen.value = false
+        toast(t('settings.realAccountLoginOk'))
+        await onSetPluginUnlockMode('real') // 现在有账号了 + 已 pin,切真实账号
+      } else if (s.loginState === 'failed') {
+        stopLoginPoll()
+        loginRunning.value = false
+        loginError.value = s.loginMessage || t('settings.realAccountLoginFailed')
+      } else if (s.loginState === 'cancelled' || s.loginState === 'idle') {
+        stopLoginPoll()
+        loginRunning.value = false
+      }
+    } catch {
+      /* 轮询失败保持等待 */
+    }
+  }, 2000)
+}
+async function cancelLogin() {
+  stopLoginPoll()
+  loginRunning.value = false
+  try {
+    await cancelRealAccountLogin()
+  } catch {
+    /* ignore */
+  }
+}
+function closeLoginModal() {
+  if (loginRunning.value) cancelLogin()
+  stopLoginPoll()
+  loginModalOpen.value = false
+}
+onUnmounted(stopLoginPoll)
 
 // theme / language 双向(同步本地状态 + 持久化服务端)。
 // setAppearance/setLocale 立刻改 DOM/localStorage(无闪烁),但服务端保存失败时
@@ -368,25 +450,12 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
       <SettingsRow :title="t('settings.restoreCodexOnExit')" :description="t('settings.restoreCodexOnExitHint')">
         <AppSwitch v-model="restoreCodexOnExit" />
       </SettingsRow>
-      <SettingsRow :title="t('settings.autoUnlockCodexPlugins')" :description="t('settings.autoUnlockCodexPluginsHint')">
-        <div class="unlock-ctl">
-          <template v-if="autoUnlockCodexPlugins">
-            <span
-              v-if="unlockStateLabel"
-              class="unlock-ctl__state"
-              :class="`is-${unlockState}`"
-              >{{ unlockStateLabel }}</span
-            >
-            <AppButton
-              size="sm"
-              variant="secondary"
-              :label="t('settings.pluginUnlockForce')"
-              :disabled="unlockForcing"
-              @click="forceUnlock"
-            />
-          </template>
-          <AppSwitch v-model="autoUnlockCodexPlugins" />
-        </div>
+      <SettingsRow :title="t('settings.pluginUnlock')" :description="t('settings.pluginUnlockHint')">
+        <SegmentedControl
+          :model-value="pluginUnlockMode ?? undefined"
+          :options="pluginUnlockOptions"
+          @update:model-value="(m) => onSetPluginUnlockMode(m as PluginUnlockMode)"
+        />
       </SettingsRow>
       <SettingsRow :title="t('settings.autoWakeCodexPet')" :description="t('settings.autoWakeCodexPetHint')">
         <AppSwitch v-model="autoWakeCodexPet" />
@@ -418,7 +487,7 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
 
     <SettingsGroup :title="t('settings.groupCodexConfig')">
       <ResidualScanPanel />
-      <SnapshotPanel />
+      <SnapshotPanel @restored="refreshPluginUnlockStatus" />
     </SettingsGroup>
 
     <SettingsGroup :title="t('settings.groupAdvanced')">
@@ -491,6 +560,35 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
         </div>
       </div>
     </AppModal>
+
+    <AppModal
+      v-if="loginModalOpen"
+      :title="t('settings.realAccountLoginTitle')"
+      @close="closeLoginModal"
+    >
+      <div class="chrome-dl">
+        <p class="chrome-dl__desc">{{ t('settings.realAccountLoginPrompt') }}</p>
+        <p v-if="loginRunning" class="chrome-dl__desc">
+          {{ t('settings.realAccountLoginRunning') }}
+        </p>
+        <p v-if="loginError" class="chrome-dl__desc chrome-dl__err">{{ loginError }}</p>
+        <div class="chrome-dl__actions">
+          <AppButton variant="ghost" :label="t('common.cancel')" @click="closeLoginModal" />
+          <AppButton
+            v-if="!loginRunning"
+            variant="primary"
+            :label="t('settings.realAccountLoginGo')"
+            @click="startLogin"
+          />
+          <AppButton
+            v-else
+            variant="ghost"
+            :label="t('settings.realAccountLoginCancelBtn')"
+            @click="cancelLogin"
+          />
+        </div>
+      </div>
+    </AppModal>
   </div>
 </template>
 
@@ -510,6 +608,9 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
   font-size: var(--fs-sm);
   line-height: 1.6;
   color: var(--text-secondary);
+}
+.chrome-dl__err {
+  color: var(--accent);
 }
 .chrome-dl__actions {
   display: flex;
@@ -577,21 +678,5 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
   height: 16px;
   flex-shrink: 0;
   color: var(--text-muted);
-}
-.unlock-ctl {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-}
-.unlock-ctl__state {
-  font-size: var(--fs-sm);
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-.unlock-ctl__state.is-injected {
-  color: var(--success);
-}
-.unlock-ctl__state.is-failed {
-  color: var(--danger);
 }
 </style>

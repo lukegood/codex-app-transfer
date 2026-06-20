@@ -82,10 +82,27 @@ pub async fn desktop_clear() -> impl IntoResponse {
         }))
         .into_response();
     }
-    match restore_codex_state(&paths) {
-        Ok(restored) => Json(json!({"success": true, "restored": restored})).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    // [MOC-257 review] 顺序 mirror exit/startup:**先 restore_codex,再 un-stash 真账号**(真账号最终写)。
+    // 反序(先 un-stash 再 restore_codex)会让 restore_codex 在 stash 还原出的真账号上 merge 旧快照 managed auth
+    // key,快照拍于 ChatGPT 登录前(无 auth_mode)时抹掉真账号 genuine 的 auth_mode=chatgpt → tokens 在但不被认作
+    // ChatGPT。改 restore_codex 先(还原 config + strip transfer key),再整文件覆盖回真账号。
+    let restored = match restore_codex_state(&paths) {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    // un-stash 失败 → **abort + surface**,别静默吞:restore_stashed_impl 先删活动再 rename stash,Windows 文件锁/
+    // 权限失败会留 auth.json 缺失;真账号未丢(rename 失败=仍在 stash),报错让用户重启自愈。
+    if let Err(e) = crate::codex_real_account::restore_stashed_real_auth().await {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("还原真账号失败(真账号仍安全在 stash,重启 Codex App Transfer 会自动恢复): {e}"),
+        )
+        .into_response();
     }
+    // 还原后已无解锁态 → 重置「最近生效」+ 关伪造,否则 status 报陈旧 last_applied 档、前端 no-op 点不动。
+    crate::codex_real_account::reset_applied_mode();
+    codex_app_transfer_proxy::set_fake_account_mode(false);
+    Json(json!({"success": true, "restored": restored})).into_response()
 }
 
 pub async fn desktop_snapshots() -> impl IntoResponse {
@@ -105,16 +122,29 @@ pub async fn desktop_restore(Json(payload): Json<DesktopRestoreRequest>) -> impl
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let snapshot_id = payload.snapshot_id.unwrap_or_default();
-    match restore_codex_snapshot(&paths, &snapshot_id, payload.cleanup_all) {
-        Ok(restored) => Json(json!({
-            "success": true,
-            "restored": restored,
-            "snapshotId": if snapshot_id.is_empty() { Value::Null } else { Value::String(snapshot_id) },
-            "cleanupAll": payload.cleanup_all,
-        }))
-        .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    // [MOC-257 review] 同 desktop_clear:顺序 mirror exit/startup —— 先 restore_codex,再 un-stash 真账号(真
+    // 账号最终写,保 genuine auth_mode 不被旧快照 merge 抹掉)。
+    let restored = match restore_codex_snapshot(&paths, &snapshot_id, payload.cleanup_all) {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    // un-stash 失败 → abort + surface(真账号仍安全在 stash,重启自愈)。
+    if let Err(e) = crate::codex_real_account::restore_stashed_real_auth().await {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("还原真账号失败(真账号仍安全在 stash,重启 Codex App Transfer 会自动恢复): {e}"),
+        )
+        .into_response();
     }
+    crate::codex_real_account::reset_applied_mode();
+    codex_app_transfer_proxy::set_fake_account_mode(false);
+    Json(json!({
+        "success": true,
+        "restored": restored,
+        "snapshotId": if snapshot_id.is_empty() { Value::Null } else { Value::String(snapshot_id) },
+        "cleanupAll": payload.cleanup_all,
+    }))
+    .into_response()
 }
 
 /// `GET /api/desktop/scan-residual` — #268 完整性自检.

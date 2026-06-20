@@ -168,10 +168,28 @@ pub fn snapshot_codex_state(
     paths: &CodexPaths,
     app_version: &str,
     provider_name: &str,
+    // [MOC-257 review] 写入端 signature-strip 要识别的 proxy 端口(含当前 settings.proxyPort,不止历史默认
+    // 18080)。否则自定义 proxyPort(如 19090)的 transfer relay 字段拍照时识别不到、被当「用户原始」固化进
+    // 快照 → restore 把它再写回(MOC-162 系统性缺口的 capture 端;这里至少让快照本身不带毒)。
+    proxy_ports: &[u16],
 ) -> Result<SnapshotManifest, CodexError> {
+    let current_dir = current_active_snapshot_dir(paths);
+    // [MOC-257 review] **promote stale 而非投毒**:本 session 还没拍 + 无 legacy 单快照、但有上个 session 的
+    // stale active 快照(`restoreCodexOnExit=false` 保留态下它是真·原始 baseline)时,把**最新**那份 rename 成
+    // 本 session active(内容 = 原始 baseline),别走下面 move_stale→recovery + 拍当前(当前 ~/.codex 已被
+    // Transfer 改过,即便 auth 反投毒 + config strip 也只是「scrub 后的当前」、不等于原始用户配置)。promote 后
+    // 剩余更旧的 stale 仍 move→recovery 去重。manifest 里 session_id 字段是旧的无妨(stale 检测按**目录名**)。
+    if !manifest_path(&current_dir).exists() && !paths.snapshot_manifest.exists() {
+        let stale = stale_active_snapshot_dirs(paths);
+        if let Some(newest) = stale.last() {
+            std::fs::rename(newest, &current_dir)?;
+            move_stale_active_snapshots_to_recovery(paths)?; // 处理剩余更旧的 stale
+            return read_manifest_from_dir(&current_dir);
+        }
+    }
+
     move_stale_active_snapshots_to_recovery(paths)?;
 
-    let current_dir = current_active_snapshot_dir(paths);
     if manifest_path(&current_dir).exists() {
         return read_manifest_from_dir(&current_dir);
     }
@@ -181,7 +199,18 @@ pub fn snapshot_codex_state(
     std::fs::create_dir_all(&current_dir)?;
 
     let config_existed = paths.config_toml.exists();
-    let auth_existed = paths.auth_json.exists();
+    // [MOC-257 review] auth 写入端反投毒(对齐下面 config 的 signature-strip):合成 auth(`cas_synthetic`)
+    // 是 Transfer 伪造、**绝非**用户原始。上个 session `restoreCodexOnExit=false` 残留合成 auth 时,原样拍照会
+    // 把合成固化成「用户原始 auth」(active 快照语义)→ restore 还原成合成 → standalone Codex 拿假凭据撞
+    // chatgpt.com。合成则快照视为**无 auth**(auth_existed=false、不拷);真账号本就在 stash,exit/startup 的
+    // restore_stashed 兜底还原。非合成(真账号 / apikey)才拍。
+    let auth_is_synthetic = paths.auth_json.exists()
+        && std::fs::read_to_string(&paths.auth_json)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("cas_synthetic").and_then(serde_json::Value::as_bool))
+            == Some(true);
+    let auth_existed = paths.auth_json.exists() && !auth_is_synthetic;
 
     if config_existed {
         let snapshot_copy = config_path(&current_dir);
@@ -196,7 +225,7 @@ pub fn snapshot_codex_state(
         for key in crate::residual::signature_fields_to_strip(
             &content,
             &paths.model_catalog_json,
-            &[18080],
+            proxy_ports,
         ) {
             crate::toml_sync::sync_root_value(&snapshot_copy, &key, None)?;
         }
@@ -944,7 +973,7 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"x\"\n").unwrap();
         std::fs::write(&paths.auth_json, "{\"OPENAI_API_KEY\":\"sk-real\"}\n").unwrap();
-        snapshot_codex_state(&paths, "v-test", "Mock").unwrap();
+        snapshot_codex_state(&paths, "v-test", "Mock", &[18080]).unwrap();
         assert!(has_snapshot(&paths));
 
         drop_all_snapshots(&paths).unwrap();
@@ -1002,7 +1031,7 @@ mod tests {
     #[test]
     fn snapshot_when_neither_file_exists() {
         let (_t, paths) = paths_with_tmp();
-        let m = snapshot_codex_state(&paths, "v2.0.0-stage2.5", "Mock").unwrap();
+        let m = snapshot_codex_state(&paths, "v2.0.0-stage2.5", "Mock", &[18080]).unwrap();
         assert!(!m.config_existed);
         assert!(!m.auth_existed);
         assert!(has_snapshot(&paths));
@@ -1019,7 +1048,7 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"existing\"\n").unwrap();
         std::fs::write(&paths.auth_json, "{\"OPENAI_API_KEY\":\"existing\"}\n").unwrap();
-        let m = snapshot_codex_state(&paths, "v", "Mock").unwrap();
+        let m = snapshot_codex_state(&paths, "v", "Mock", &[18080]).unwrap();
         assert!(m.config_existed);
         assert!(m.auth_existed);
         assert_eq!(
@@ -1033,10 +1062,10 @@ mod tests {
         let (_t, paths) = paths_with_tmp();
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "old\n").unwrap();
-        snapshot_codex_state(&paths, "v", "Mock").unwrap();
+        snapshot_codex_state(&paths, "v", "Mock", &[18080]).unwrap();
         // 改了 config.toml,再 snapshot 一次 —— 不应覆盖原始备份
         std::fs::write(&paths.config_toml, "new\n").unwrap();
-        snapshot_codex_state(&paths, "v", "Mock").unwrap();
+        snapshot_codex_state(&paths, "v", "Mock", &[18080]).unwrap();
         assert_eq!(
             read_snapshot_config(&paths).unwrap(),
             "old\n",
@@ -1047,14 +1076,17 @@ mod tests {
     #[test]
     fn drop_snapshot_clears_dir() {
         let (_t, paths) = paths_with_tmp();
-        snapshot_codex_state(&paths, "v", "Mock").unwrap();
+        snapshot_codex_state(&paths, "v", "Mock", &[18080]).unwrap();
         assert!(has_snapshot(&paths));
         drop_snapshot(&paths).unwrap();
         assert!(!has_snapshot(&paths));
     }
 
+    // [MOC-257 review] restoreCodexOnExit=false 保留态:上个 session 的 stale active 快照(原始 baseline,config
+    // "original")是真基线。snapshot_codex_state 应**promote** 它为本 session active(保住原始),而非把当前
+    // (Transfer 已改的 "current")拍成 active 快照、把原始挪去 recovery —— 那会让后续 restore 还原成被改过的当前。
     #[test]
-    fn stale_active_snapshot_moves_to_recovery_before_new_snapshot() {
+    fn stale_active_snapshot_promoted_as_baseline_not_overwritten_by_current() {
         let (_t, paths) = paths_with_tmp();
         let stale_dir = paths.active_snapshots_dir.join("old-session");
         std::fs::create_dir_all(&stale_dir).unwrap();
@@ -1077,16 +1109,25 @@ mod tests {
 
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"current\"\n").unwrap();
-        snapshot_codex_state(&paths, "v-new", "New").unwrap();
+        snapshot_codex_state(&paths, "v-new", "New", &[18080]).unwrap();
 
+        // stale 被 rename 成本 session active(不再在原 stale 目录)。
         assert!(!stale_dir.exists());
         let snapshots = list_snapshots(&paths);
+        // active 快照 = 被 promote 的**原始**(app_version v-old),**不是**当前的 v-new 拍照。
         assert!(snapshots
             .iter()
-            .any(|s| s.kind == "active" && s.app_version == "v-new"));
-        assert!(snapshots
+            .any(|s| s.kind == "active" && s.app_version == "v-old"));
+        assert!(!snapshots.iter().any(|s| s.app_version == "v-new"));
+        // promote 的那份没被挪去 recovery。
+        assert!(!snapshots
             .iter()
             .any(|s| s.kind == "recovery" && s.id == "old-session"));
+        // active 快照内容 = 原始 "original",而非被 Transfer 改过的 "current"。
+        let active_config =
+            std::fs::read_to_string(config_path(&current_active_snapshot_dir(&paths))).unwrap();
+        assert!(active_config.contains("original"));
+        assert!(!active_config.contains("current"));
     }
 
     // ── MOC-148 搭车:recovery/ 去重 + 上限 ────────────────────────────
@@ -1473,7 +1514,7 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"current\"\n").unwrap();
 
-        snapshot_codex_state(&paths, "v-new", "New").unwrap();
+        snapshot_codex_state(&paths, "v-new", "New", &[18080]).unwrap();
 
         assert!(
             snapshot_dirs_under(&paths.recovery_snapshots_dir).len() <= MAX_RECOVERY_SNAPSHOTS,

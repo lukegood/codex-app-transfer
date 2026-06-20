@@ -59,29 +59,6 @@ export function openSnapshotDir() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Codex 插件解锁 daemon(CDP 注入,/api/desktop/plugin-unlock/*)
-// ───────────────────────────────────────────────────────────────────────────
-export type PluginUnlockState =
-  | 'disconnected'
-  | 'connecting'
-  | 'connected'
-  | 'injected'
-  | 'failed'
-export interface PluginUnlockStatusResp {
-  status: PluginUnlockState
-  message: string
-}
-export function pluginUnlockStatus() {
-  return api<PluginUnlockStatusResp>('GET', '/api/desktop/plugin-unlock/status')
-}
-export function pluginUnlockStart() {
-  return api('POST', '/api/desktop/plugin-unlock/start')
-}
-export function pluginUnlockReinject() {
-  return api('POST', '/api/desktop/plugin-unlock/reinject')
-}
-
-// ───────────────────────────────────────────────────────────────────────────
 // 还原 Codex 原配置(/api/desktop/clear,设置页快照「还原」复用 useCodexRestore)
 // ───────────────────────────────────────────────────────────────────────────
 export function clearDesktop() {
@@ -170,4 +147,101 @@ export function traceViewerStop() {
 }
 export function openTraceViewer() {
   return api<{ success?: boolean }>('POST', '/api/trace-viewer/open')
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 三态插件解锁选择器(/api/desktop/plugin-unlock/*,MOC-257)
+// 统一「关闭 / 模拟账号 / 真实账号」三态,取代旧的 autoUnlockCodexPlugins(CDP,废弃)+ 模拟账号开关。
+// synthetic:写合成 auth.json + proxy 伪造;real:用真实账号 relay 透传;off:转移备份 auth.json、退出还原。
+// ───────────────────────────────────────────────────────────────────────────
+export type PluginUnlockMode = 'off' | 'synthetic' | 'real'
+
+export interface PluginUnlockStatus {
+  /** 最近成功 apply 的**实际生效**三态;**null = 未 apply 过**(启动跳过 / 首次,~/.codex 是 restore 后原态) */
+  mode: PluginUnlockMode | null
+  /** 持久值(用户是否手动设过);null = 未设、走默认推导 */
+  persisted: PluginUnlockMode | null
+  /** 本地是否有真账号(活动或 stash,含失效的) */
+  hasRealAccount: boolean
+  /** 真账号是否**实际可用**(非空 + 未过期 + 未撤销) */
+  realAccountUsable: boolean
+  /** 活动 auth.json 当前是否合成账号 */
+  activeIsSynthetic: boolean
+}
+
+export async function getPluginUnlockStatus(): Promise<PluginUnlockStatus> {
+  const r = await api<{
+    mode?: PluginUnlockMode | null
+    persisted?: PluginUnlockMode | null
+    hasRealAccount?: boolean
+    realAccountUsable?: boolean
+    activeIsSynthetic?: boolean
+  }>('GET', '/api/desktop/plugin-unlock/status')
+  return {
+    mode: r.mode ?? null,
+    persisted: r.persisted ?? null,
+    hasRealAccount: !!r.hasRealAccount,
+    realAccountUsable: !!r.realAccountUsable,
+    activeIsSynthetic: !!r.activeIsSynthetic,
+  }
+}
+
+export interface SetPluginUnlockResult {
+  success: boolean
+  /** 用户意图(持久) */
+  mode: PluginUnlockMode
+  /** 实际生效(real 失效会降级 synthetic) */
+  effective?: PluginUnlockMode
+  /** real 是否被降级成 synthetic */
+  degraded?: boolean
+  message?: string
+}
+
+export function setPluginUnlockMode(mode: PluginUnlockMode) {
+  return api<SetPluginUnlockResult>('POST', '/api/desktop/plugin-unlock/set', { mode })
+}
+
+// ── 真实账号登录(codex login,/api/desktop/real-account/*)——「真实账号」档无账号时引导登录 ──
+export type RealAccountLoginState = 'idle' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+
+export interface RealAccountLoginStatus {
+  loggedIn: boolean
+  loginState: RealAccountLoginState
+  loginMessage?: string
+}
+
+/** 读真账号 + 登录流程状态(login 字段是 serde tagged {state, message})。 */
+export async function getRealAccountStatus(): Promise<RealAccountLoginStatus> {
+  const r = await api<{
+    status?: { logged_in?: boolean }
+    login?: { state?: RealAccountLoginState; message?: string } | RealAccountLoginState
+  }>('GET', '/api/desktop/real-account/status')
+  const login = r.login ?? {}
+  const loginState = (typeof login === 'string' ? login : login.state) ?? 'idle'
+  const loginMessage = typeof login === 'string' ? undefined : login.message
+  return { loggedIn: !!r.status?.logged_in, loginState, loginMessage }
+}
+
+/** 启动官方 codex login(非阻塞,会弹浏览器做 ChatGPT OAuth)。 */
+export function startRealAccountLogin() {
+  return api<{ success: boolean; message?: string }>('POST', '/api/desktop/real-account/login')
+}
+
+export function cancelRealAccountLogin() {
+  return api<{ success: boolean; cancelled?: boolean }>(
+    'POST',
+    '/api/desktop/real-account/login/cancel',
+  )
+}
+
+/**
+ * 持久保留当前真实账号到 mirror/stash(登录成功后**自动调**)。否则登录前已有快照(startup auto-apply)+
+ * restoreCodexOnExit 开时,新登录账号没存进 mirror → 退出 restore 重放登录前快照、抹掉 auth_mode,Codex 不再
+ * 认作 ChatGPT。
+ */
+export function pinCurrentRealAccount() {
+  return api<{ success: boolean; message?: string }>(
+    'POST',
+    '/api/desktop/real-account/pin-current',
+  )
 }
