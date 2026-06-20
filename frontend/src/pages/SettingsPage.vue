@@ -6,7 +6,7 @@ import { useFont, type FontChoice, type FontSize } from '@/composables/useFont'
 import { useSettingsStore } from '@/stores/settings'
 import type { Settings } from '@/api/settings'
 import { useToast } from '@/composables/useToast'
-import { getAppVersion, checkAppUpdate, openExternalUrl } from '@/api/system'
+import { getAppVersion, checkAppUpdate, installAppUpdate, openExternalUrl } from '@/api/system'
 import SettingsGroup from '@/components/ui/SettingsGroup.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
@@ -36,6 +36,11 @@ const { current: appearance, set: setAppearance } = useAppearance()
 const { show: toast } = useToast()
 const appVersion = ref('')
 const feedbackOpen = ref(false)
+const updateAvailable = ref(false)
+const installSupported = ref(false)
+const latestVersion = ref('')
+const installModalOpen = ref(false)
+const installing = ref(false)
 
 onMounted(() => {
   if (!store.loaded) store.load().catch(() => {})
@@ -58,15 +63,37 @@ function refreshPluginUnlockStatus() {
 // 关于:检查更新 + 外链(走系统浏览器)
 async function onCheckUpdate() {
   try {
+    // 以后端权威 updateAvailable 为准(不再用 latest!=appVersion 字符串比较兜底,避免 /api/version
+    // 未就绪 / 格式差异误判);installSupported=false(如 Linux)时不显安装按钮,仅提示有更新。
     const r = await checkAppUpdate()
-    const latest = r.latestVersion
-    if (r.hasUpdate || (latest && latest !== appVersion.value)) {
-      toast(tFmt('about.updateAvailable', { version: latest || '' }))
+    if (r.updateAvailable) {
+      updateAvailable.value = true
+      installSupported.value = !!r.installSupported
+      latestVersion.value = r.latestVersion || ''
+      toast(tFmt('about.updateAvailable', { version: r.latestVersion || '' }))
     } else {
+      updateAvailable.value = false
+      installSupported.value = false
       toast(t('about.upToDate'))
     }
   } catch (e) {
     toast((e as Error).message || t('about.checkFailed'), 'error')
+  }
+}
+// 「能查不能装」补齐:有更新时弹确认 → 调 /api/update/install(下载 installer + app 退出拉起)。
+async function confirmInstall() {
+  if (installing.value) return
+  installing.value = true
+  try {
+    const r = await installAppUpdate()
+    // installer 已启动、app 即将退出;尽量先把后端提示 toast 出来(best-effort)。
+    toast(r.message || t('settings.installUpdate'))
+    installModalOpen.value = false
+  } catch (e) {
+    // 后端错误(如 macOS translocation:未拖进 /Applications)原样透出指引。
+    toast((e as Error).message || t('about.checkFailed'), 'error')
+  } finally {
+    installing.value = false
   }
 }
 function openExternal(url: string) {
@@ -529,6 +556,13 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
     <SettingsGroup :title="t('about.group')">
       <SettingsRow :title="t('about.version')" :description="appVersion ? `v${appVersion}` : '…'">
         <AppButton size="sm" variant="secondary" :label="t('about.checkUpdate')" @click="onCheckUpdate" />
+        <AppButton
+          v-if="updateAvailable && installSupported"
+          size="sm"
+          variant="primary"
+          :label="t('settings.installUpdate')"
+          @click="installModalOpen = true"
+        />
       </SettingsRow>
       <SettingsRow :title="t('settings.updateUrl')" :description="t('settings.updateUrlDesc')">
         <code class="settings-readonly">{{ UPDATE_REPO_URL }}</code>
@@ -585,6 +619,28 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
             variant="ghost"
             :label="t('settings.realAccountLoginCancelBtn')"
             @click="cancelLogin"
+          />
+        </div>
+      </div>
+    </AppModal>
+
+    <AppModal
+      v-if="installModalOpen"
+      :title="t('settings.installUpdate')"
+      @close="installModalOpen = false"
+    >
+      <div class="chrome-dl">
+        <p v-if="latestVersion" class="chrome-dl__desc">
+          {{ tFmt('about.updateAvailable', { version: latestVersion }) }}
+        </p>
+        <p class="chrome-dl__desc">{{ t('confirm.installUpdate') }}</p>
+        <div class="chrome-dl__actions">
+          <AppButton variant="ghost" :label="t('common.cancel')" @click="installModalOpen = false" />
+          <AppButton
+            variant="primary"
+            :label="t('settings.installUpdate')"
+            :disabled="installing"
+            @click="confirmInstall"
           />
         </div>
       </div>
