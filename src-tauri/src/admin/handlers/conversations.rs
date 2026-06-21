@@ -14,6 +14,7 @@ use axum::{
 };
 use codex_app_transfer_codex_integration::CodexPaths;
 use codex_app_transfer_conversation_export as cexp;
+use codex_app_transfer_proxy::proxy_telemetry;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -372,6 +373,68 @@ pub async fn delete_handler(Json(req): Json<DeleteRequest>) -> impl IntoResponse
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// `POST /api/conversations/clear-all` — 一键清空本地会话历史(两者都清):
+/// ① 先清 proxy 的 L2 Responses 续轮缓存(`~/.codex-app-transfer/sessions.db` 全表 + 内存 hot cache)。
+/// ② 再把全部 Codex 对话 rollout(`~/.codex/sessions` + `~/.codex/archived_sessions` 的 `.jsonl`;
+///    冷归档 `.jsonl.zst` 当前不含、见 MOC-214)**移到系统回收站**(可恢复)。
+///
+/// **顺序**:先做可再生的缓存清除——若 db 不可达直接报错,此时 rollout 还没动、磁盘状态一致;
+/// 缓存清完再 trash rollout,trash 部分失败不报 500、收进 `failed` 由前端逐条提示。
+///
+/// **注意**:清 L2 缓存会让正在进行的 Codex 会话下一轮 cache-miss → OpenAI 400
+/// `previous_response_not_found` → fail-fast(需重发)。确认弹窗已告知用户。
+///
+/// 前端设置页「会话历史」→「清空会话历史」按钮(二次确认)调用。非破坏:rollout 走系统回收站、
+/// 不彻底删,用户可在 Finder Trash 恢复。无会话时也照常清缓存。
+pub async fn clear_all_handler() -> impl IntoResponse {
+    let codex_home = match codex_home_from_env() {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+
+    // ① 先清 proxy L2 续轮缓存(db 不可达 → 直接报错,此时 rollout 未动)
+    let cache_rows =
+        match codex_app_transfer_adapters::responses::session::global_response_session_cache()
+            .clear_all_persisted()
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("clear sessions.db failed: {e}"),
+                )
+                .into_response()
+            }
+        };
+
+    // ② 再把全部 rollout 移回收站(单次扫描;部分失败收进 failed、不报 500)
+    let trash = match cexp::move_all_sessions_to_trash(&codex_home) {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    // 有任何 rollout 移失败 → success=false,前端据此弹错误 + 逐条 failed 提示
+    // (对齐 delete_handler 的 MED-7:绝不把「全/部分失败」报成成功)。
+    let success = trash.failed.is_empty();
+    proxy_telemetry().logs.add(
+        "INFO",
+        format!(
+            "session history cleared by admin: {} rollout trashed, {} failed, {cache_rows} L2 rows removed",
+            trash.deleted.len(),
+            trash.failed.len(),
+        ),
+    );
+
+    Json(json!({
+        "success": success,
+        "sessionsTrashed": trash.deleted.len(),
+        "sessionsFailed": trash.failed.len(),
+        "failed": trash.failed,
+        "cacheRowsRemoved": cache_rows,
+    }))
+    .into_response()
 }
 
 /// 把 session id / 时间戳里可能的 `/` `\` 等剔掉,生成安全文件名。

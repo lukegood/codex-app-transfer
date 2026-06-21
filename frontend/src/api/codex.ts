@@ -189,6 +189,35 @@ export const getConversations = () =>
 // 后端 detail 返回**裸** NormalizedSession({meta,turns,warnings} 顶层,无 session 包裹)
 export const getConversation = (id: string) =>
   api<ConversationDetail>('GET', `/api/conversations/${encodeURIComponent(id)}`)
+
+// 清空会话历史(两者都清):全部 rollout 移回收站(可恢复)+ 清 proxy L2 续轮缓存。
+export interface ClearAllConversationsResult {
+  success: boolean
+  sessionsTrashed: number
+  sessionsFailed: number
+  failed?: { sessionId: string; reason: string }[]
+  cacheRowsRemoved: number
+}
+// 不走 api():后端在「部分/全部 rollout 移回收站失败」时返 HTTP 200 + {success:false, sessionsFailed>0},
+// api() 遇 success===false 即抛、会吞掉 trashed/failed 计数,UI 无法逐条提示。用 raw fetch 读完整
+// payload,只在真正的传输/网关错误(非 2xx 且带 message,或非 JSON)时抛。
+export async function clearAllConversations(): Promise<ClearAllConversationsResult> {
+  const resp = await fetch('/api/conversations/clear-all', {
+    method: 'POST',
+    headers: { 'X-CAS-Request': '1', 'Content-Type': 'application/json' },
+  })
+  let data: ClearAllConversationsResult & { message?: string }
+  try {
+    data = await resp.json()
+  } catch (parseErr) {
+    throw new Error(
+      `Request failed: POST /api/conversations/clear-all — HTTP ${resp.status} ${resp.statusText || ''} ` +
+        `(非 JSON 响应: ${String(parseErr)})`,
+    )
+  }
+  if (!resp.ok) throw new Error(data.message || `Request failed: HTTP ${resp.status}`)
+  return data
+}
 // 后端「全部失败」时返 HTTP 200 + {success:false, deleted:[], failed:[...]}(conversations.rs)。
 // 不能走 api():其遇 success===false 即抛,会吞掉 failed 明细,UI 退回泛化报错而非逐条提示。
 // 用 raw fetch 读完整 payload,只在真正的传输/网关错误(非 2xx / 非 JSON)时抛。
