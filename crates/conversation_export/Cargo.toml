@@ -10,7 +10,9 @@ repository.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order:[CAT-255] 就地改写 rollout 首行 session_meta 时保留原 JSON 键序,
+# 别让 serde_json 默认按字母重排(Codex 对那行格式敏感,重排可能解析失败/backfill 错乱)。
+serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
@@ -19,6 +21,9 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 trash = "5"
 # [MOC-214] 检测到 Codex 冷压缩 rollout(.jsonl.zst)时一次性 warn(检测哨)。
 tracing = "0.1"
+# [CAT-255] 读/写 Codex `~/.codex/state_<N>.sqlite`(threads 表)做隔离会话导入/恢复。
+# bundled = 静态编译 SQLite,无需系统 libsqlite3(与 crates/adapters 同款)。
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"
