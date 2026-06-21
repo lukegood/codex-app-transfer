@@ -719,16 +719,16 @@ fn quota_bar(w: &QuotaWindow) -> serde_json::Value {
     json!({"kind":"bar","cls":"quota","label":w.label,"pct":pct,"detail":detail,"hot":pct <= 10})
 }
 
-/// [MOC-204 / MOC-211] 额度行:白名单 provider 的每个窗口渲染一条 bar(antigravity/GLM =
-/// 5h + 每周;MiMo = 套餐用量月窗口)。label 随窗口走,故 5h/周 与 月度套餐各显各、互不混。
-/// 非白名单 / 拿不到 → 空(不显额度行)。
+/// [MOC-204 / MOC-211 / CAT-256] 额度行:白名单 provider 的滚动窗口按 `5h→周→月` 固定顺序逐条
+/// 渲染成 bar(antigravity/GLM = 5h+周;OpenCode Go = 5h+周+月;MiMo = 月槽「套餐用量」)。每档
+/// `Option`,无则不渲染该条。label 随窗口走,各显各、互不混。非白名单 / 拿不到 → 空(不显额度行)。
 fn quota_rows(quota: Option<&ProviderQuota>) -> Vec<serde_json::Value> {
     let Some(q) = quota else {
         return vec![];
     };
-    // 先窗口 bar(5h/周/套餐用量),再数值条目(DeepSeek 余额等)。stat 行无进度条:
-    // 注入脚本 buildRow 对非 bar/duo/ctx 的 kind 落 `cqs`(label + detail)分支渲染。
-    let mut rows: Vec<serde_json::Value> = q.windows.iter().map(quota_bar).collect();
+    // 先三槽窗口 bar(5h/周/月,RollingWindows::iter 固定序),再数值条目(DeepSeek 余额等)。
+    // stat 行无进度条:注入脚本 buildRow 对非 bar/duo/ctx 的 kind 落 `cqs`(label + detail)分支渲染。
+    let mut rows: Vec<serde_json::Value> = q.rolling.iter().map(quota_bar).collect();
     rows.extend(
         q.stats
             .iter()
@@ -883,7 +883,7 @@ fn is_quota_whitelisted(authscheme: &str) -> bool {
 }
 
 /// 从 URL 轻量提取 host(剥 scheme / 端口 / userinfo,不引 url crate)。
-fn host_of(url: &str) -> Option<String> {
+pub(crate) fn host_of(url: &str) -> Option<String> {
     let after = url.split("://").nth(1).unwrap_or(url);
     let authority = after.split('/').next().unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or(authority);
@@ -953,66 +953,53 @@ fn active_glm_provider() -> Option<(String, String)> {
     Some((host, api_key.to_string()))
 }
 
-/// [MOC-211] 活动 provider 若是 MiMo Token Plan(baseUrl host 含 `xiaomimimo.com` 且路径含
-/// `token-plan`)且已存网页 session → 返回 `(provider id, mimoCookie)`,否则 None。按量计费的
-/// MiMo(`api.xiaomimimo.com`,无 token-plan)不匹配——它无订阅套餐额度。额度查询走小米账号
-/// session(见 mimo_quota / mimo_session),非 apiKey。
-fn active_mimo_session() -> Option<(String, String)> {
-    let cfg = crate::admin::registry_io::load().ok()?;
-    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
-    let providers = cfg.get("providers")?.as_array()?;
-    let p = match active_id {
-        Some(id) => providers
-            .iter()
-            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
-        None => providers.first()?,
+/// [MOC-211] MiMo Token Plan 的额度源接线规格:host `xiaomimimo.com` + 路径含 `token-plan`
+/// (区分按量 MiMo `api.xiaomimimo.com`,它无订阅套餐额度);session cookie 存 `mimoCookie`。
+const MIMO_SOURCE_SPEC: crate::web_session_quota::QuotaSourceSpec =
+    crate::web_session_quota::QuotaSourceSpec {
+        host_suffix: "xiaomimimo.com",
+        path_contains: Some("token-plan"),
+        cookie_field: "mimoCookie",
+        workspace_field: None,
     };
-    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
-    let host = host_of(base_url)?;
-    if !(host.ends_with("xiaomimimo.com") && base_url.contains("token-plan")) {
-        return None;
-    }
-    let id = p.get("id").and_then(|v| v.as_str())?.to_string();
-    let cookie = p
-        .get("mimoCookie")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    Some((id, cookie))
+
+/// 活动 provider 是 MiMo token-plan 且已存网页 session → `(provider id, mimoCookie)`,否则 None。
+fn active_mimo_session() -> Option<(String, String)> {
+    let s = crate::web_session_quota::active_session(&MIMO_SOURCE_SPEC)?;
+    Some((s.provider_id, s.cookie))
 }
 
-/// session 失效(Auth)时清掉该 provider 存的 `mimoCookie`,让前端 `hasMimoCookie` 转 false
-/// 显「未登录」、提示重新登录(MiMo session 无 refresh,只能重登)。
-fn clear_mimo_cookie(provider_id: &str, used_cookie: &str) {
-    let _ = crate::admin::registry_io::with_config_write(|cfg| {
-        let Some(providers) = cfg
-            .as_object_mut()
-            .and_then(|o| o.get_mut("providers"))
-            .and_then(|v| v.as_array_mut())
-        else {
-            return Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()));
-        };
-        let mut changed = false;
-        for p in providers.iter_mut() {
-            if p.get("id").and_then(|v| v.as_str()) == Some(provider_id) {
-                if let Some(obj) = p.as_object_mut() {
-                    // 仅当当前存的 cookie 仍是本次失败用的那把才清:避免请求在途时用户已重新
-                    // 登录(存了新 session),这条迟到的 Auth 把刚捕获的新 cookie 误删。
-                    let still_same =
-                        obj.get("mimoCookie").and_then(|v| v.as_str()) == Some(used_cookie);
-                    if still_same && obj.remove("mimoCookie").is_some() {
-                        changed = true;
-                    }
-                }
-                break;
-            }
-        }
-        if changed {
-            Ok(crate::admin::registry_io::ConfigMutation::Modified(()))
-        } else {
-            Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()))
-        }
-    });
+/// [CAT-256] OpenCode Go 的额度源接线规格:host `opencode.ai`;session cookie 存 `opencodeCookie`,
+/// workspace id 存 `opencodeWorkspaceId`(查 Go 用量端点 `/workspace/<id>/go` 必需,缺则不查)。
+const OPENCODE_SOURCE_SPEC: crate::web_session_quota::QuotaSourceSpec =
+    crate::web_session_quota::QuotaSourceSpec {
+        host_suffix: "opencode.ai",
+        path_contains: None,
+        cookie_field: "opencodeCookie",
+        workspace_field: Some("opencodeWorkspaceId"),
+    };
+
+/// 活动 provider 是 OpenCode Go 且已存 session + workspace → `(provider id, workspace_id, opencodeCookie)`。
+fn active_opencode_go_session() -> Option<(String, String, String)> {
+    let s = crate::web_session_quota::active_session(&OPENCODE_SOURCE_SPEC)?;
+    Some((s.provider_id, s.workspace_id?, s.cookie))
+}
+
+/// [CAT-256 后续] Kimi Code 的额度源接线规格:host `api.kimi.com` + 路径含 `coding`;`kimiCookie`
+/// 字段存的是 web 控制台 access_token(非 cookie,见 kimi_session 的 localStorage 抓取),供
+/// `Authorization: Bearer` 用。
+const KIMI_SOURCE_SPEC: crate::web_session_quota::QuotaSourceSpec =
+    crate::web_session_quota::QuotaSourceSpec {
+        host_suffix: "api.kimi.com",
+        path_contains: Some("coding"),
+        cookie_field: "kimiCookie",
+        workspace_field: None,
+    };
+
+/// 活动 provider 是 Kimi Code 且已存 access_token → `(provider id, access_token)`,否则 None。
+fn active_kimi_session() -> Option<(String, String)> {
+    let s = crate::web_session_quota::active_session(&KIMI_SOURCE_SPEC)?;
+    Some((s.provider_id, s.cookie))
 }
 
 /// [MOC-211] 活动 provider 若是 DeepSeek(baseUrl host 含 `deepseek.com`)且有 apiKey →
@@ -1260,11 +1247,107 @@ async fn fetch_mimo_quota(
         Err(QuotaError::Auth) => {
             tracing::debug!("[Quota] MiMo session 失效 → 清缓存 + 清存储 cookie(需重新登录)");
             *cache = None;
-            clear_mimo_cookie(&id, &cookie);
+            crate::web_session_quota::clear_cookie(&id, MIMO_SOURCE_SPEC.cookie_field, &cookie);
             None
         }
         Err(QuotaError::Transient(e)) => {
             tracing::debug!(error = %e, "[Quota] MiMo quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// [CAT-256] 取 OpenCode Go 套餐 5h/周/月 用量(host gate + 控制台网页 session + workspace id + 45s
+/// 缓存)。非 OpenCode Go / 无 cookie+workspace → 清缓存 + None。session 失效(Auth)→ 清缓存 +
+/// 清存储 cookie(前端转「未登录」提示重登;OpenCode 控制台 session 无 refresh)。镜像 fetch_mimo_quota。
+async fn fetch_opencode_go_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::opencode_go_quota::{fetch_opencode_go_quota as fetch_summary, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((id, workspace_id, cookie)) = active_opencode_go_session() else {
+        *cache = None;
+        return None;
+    };
+    // 指纹按 (provider id, workspace_id, cookie):换账号重登(cookie/workspace 变)即缓存失效。
+    let fp = quota_fingerprint(&[&id, &workspace_id, &cookie]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    match fetch_summary(http, &workspace_id, &cookie).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth) => {
+            tracing::debug!(
+                "[Quota] OpenCode 控制台 session 失效 → 清缓存 + 清存储 cookie(需重新登录)"
+            );
+            *cache = None;
+            crate::web_session_quota::clear_cookie(&id, OPENCODE_SOURCE_SPEC.cookie_field, &cookie);
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] OpenCode Go quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// [CAT-256 后续] 取 Kimi Code 套餐用量(host gate + 控制台 access_token + 45s 缓存)。非 Kimi Code /
+/// 无 token → 清缓存 + None。token 失效(Auth)→ 清缓存 + 清存储 token(前端转「未登录」提示重登)。
+async fn fetch_kimi_code_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::kimi_code_quota::{fetch_kimi_code_quota as fetch_summary, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((id, token)) = active_kimi_session() else {
+        *cache = None;
+        return None;
+    };
+    let fp = quota_fingerprint(&[&id, &token]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    match fetch_summary(http, &token).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth) => {
+            tracing::debug!("[Quota] Kimi access_token 失效 → 清缓存 + 清存储 token(需重新登录)");
+            *cache = None;
+            crate::web_session_quota::clear_cookie(&id, KIMI_SOURCE_SPEC.cookie_field, &token);
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] Kimi Code quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
             match cache.as_mut() {
                 Some((cfp, q, at)) if *cfp == fp => {
                     *at = std::time::Instant::now();
@@ -1461,6 +1544,8 @@ pub async fn run_quota_daemon() {
     // 缓存带账号指纹(u64):切同类型 provider 的不同账号时即失效,不串旧账号额度。
     let mut glm_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut mimo_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut opencode_go_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut kimi_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut deepseek_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut anyrouter_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut moonshot_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
@@ -1493,6 +1578,8 @@ pub async fn run_quota_daemon() {
             .map(ProviderQuota::from);
         let glm = fetch_glm_quota(&quota_http, &mut glm_cache).await;
         let mimo = fetch_mimo_quota(&quota_http, &mut mimo_cache).await;
+        let opencode_go = fetch_opencode_go_quota(&quota_http, &mut opencode_go_cache).await;
+        let kimi = fetch_kimi_code_quota(&quota_http, &mut kimi_cache).await;
         let deepseek = fetch_deepseek_quota(&quota_http, &mut deepseek_cache).await;
         let anyrouter = fetch_anyrouter_quota(&quota_http, &mut anyrouter_cache).await;
         let moonshot = fetch_moonshot_quota(&quota_http, &mut moonshot_cache).await;
@@ -1500,6 +1587,8 @@ pub async fn run_quota_daemon() {
         let quota = antigravity
             .or(glm)
             .or(mimo)
+            .or(opencode_go)
+            .or(kimi)
             .or(deepseek)
             .or(anyrouter)
             .or(moonshot)
@@ -1693,18 +1782,9 @@ mod tests {
         // [MOC-204 / MOC-211] 白名单 provider:5h + weekly 两 bar 在前,显**剩余**百分比。
         // 用中性 ProviderQuota 多窗口(antigravity / GLM 都归一到它)。
         let q = ProviderQuota {
-            windows: vec![
-                QuotaWindow {
-                    label: "5 小时额度".into(),
-                    remaining_percent: 94.0, // 剩 94%
-                    reset_rfc3339: Some("2026-06-13T17:56:06Z".into()),
-                },
-                QuotaWindow {
-                    label: "每周额度".into(),
-                    remaining_percent: 8.0, // 剩 8% → 应标红 hot
-                    reset_rfc3339: Some("2026-06-20T12:56:06Z".into()),
-                },
-            ],
+            rolling: crate::provider_quota::RollingWindows::default()
+                .five_hour(94.0, Some("2026-06-13T17:56:06Z".into())) // 剩 94%
+                .weekly(8.0, Some("2026-06-20T12:56:06Z".into())), // 剩 8% → 应标红 hot
             ..Default::default()
         };
         let p = build_payload(Some(&q), None);

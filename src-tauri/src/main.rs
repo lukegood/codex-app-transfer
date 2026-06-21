@@ -11,11 +11,15 @@ mod codex_real_account;
 mod codex_theme_injector;
 mod deepseek_quota;
 mod glm_quota;
+mod kimi_code_quota;
+mod kimi_session;
 mod macos_dock;
 mod mcp_webfetch_server;
 mod mimo_quota;
 mod mimo_session;
 mod moonshot_quota;
+mod opencode_go_quota;
+mod opencode_session;
 mod provider_quota;
 mod proxy_runner;
 #[cfg(target_os = "macos")]
@@ -23,6 +27,7 @@ mod single_instance;
 mod system_proxy;
 mod telemetry_bridge;
 mod trace_viewer;
+mod web_session_quota;
 #[cfg(target_os = "windows")]
 mod windows_msix;
 
@@ -140,9 +145,9 @@ fn main() {
         })
         .setup(|app| {
             let startup_proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
-            // [MOC-211] 存全局 AppHandle 供 MiMo 小米账号内嵌 webview 登录开窗用
-            // (AdminState 在建 router 时尚无 AppHandle,故走全局 OnceLock)。
-            mimo_session::init(app.handle().clone());
+            // [MOC-211 / CAT-256] 存全局 AppHandle 供 web-session provider(MiMo / OpenCode)内嵌
+            // webview 登录开窗用(AdminState 在建 router 时尚无 AppHandle,故走全局 OnceLock)。
+            web_session_quota::init(app.handle().clone());
             // [Dock 隐藏] 存全局 AppHandle 供 save_settings hot-reload 切 activation policy。
             macos_dock::init(app.handle().clone());
 

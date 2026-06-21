@@ -33,6 +33,8 @@ const ICON_MAP: Record<string, IconSpec> = {
   generativelanguage: { logo: 'assets/providers/google-ai-studio.png' },
   'grok-web': { logo: 'assets/providers/grok.svg' },
   anyrouter: { logo: 'assets/providers/anyrouter.png' },
+  // OpenCode Go(opencode.ai)官方 favicon(深底白 O logo);无其它 provider 字符串含 opencode,无歧义
+  opencode: { logo: 'assets/providers/opencode.svg' },
 }
 
 // 逐字移植 computeIcon: 拼 id+name+baseUrl+apiFormat → normalize(_/空格→-)→ 子串匹配 ICON_MAP
@@ -58,6 +60,8 @@ export function mapProvider(provider: Record<string, any>, activeId: string | nu
     authScheme: provider.authScheme || 'bearer',
     hasApiKey: !!provider.hasApiKey,
     hasMimoCookie: !!provider.hasMimoCookie,
+    hasOpencodeCookie: !!provider.hasOpencodeCookie,
+    hasKimiCookie: !!provider.hasKimiCookie,
     extraHeaders: provider.extraHeaders || {},
     modelCapabilities: provider.modelCapabilities || {},
     requestOptions: provider.requestOptions || {},
@@ -141,10 +145,24 @@ export const getProviderSecret = (id: string) =>
 export const mimoLogin = (id: string) =>
   api<{ captured?: boolean }>('POST', `/api/providers/${id}/mimo-login`)
 
+// OpenCode 账号登录(内嵌窗口抓控制台 session cookie,供后续查 OpenCode Go 套餐额度)。
+// 长阻塞:窗口登录完成/关闭才返回;captured=true 表示已抓到 session。
+export const opencodeLogin = (id: string) =>
+  api<{ captured?: boolean }>('POST', `/api/providers/${id}/opencode-login`)
+
+// Kimi 账号登录(内嵌窗口抓控制台 session cookie,供后续查 Kimi Code 套餐额度)。
+export const kimiLogin = (id: string) =>
+  api<{ captured?: boolean }>('POST', `/api/providers/${id}/kimi-login`)
+
 // 获取上游可用模型:已存在 provider 走 id(用落盘 key);草稿(新增/编辑未存)走 payload。
 // 响应除 models 列表外还带 suggested(后端 suggest_model_mappings 自动建议的「槽位→模型 id」映射,
 // 目前主要给 default 槽),供前端 fetchModels 一键预填空槽位(取代已删的 autofill 专用端点)。
-type ModelsAvailableResp = { models?: unknown[]; suggested?: Record<string, string> }
+type ModelsAvailableResp = {
+  models?: unknown[]
+  suggested?: Record<string, string>
+  // [CAT-256] 后端为 openai_chat provider 剔除掉走 messages(anthropic)端点的模型 id(如 OpenCode Go 的 minimax/qwen 系)
+  filteredMessagesModels?: string[]
+}
 export const fetchProviderModels = (id: string) =>
   api<ModelsAvailableResp>('GET', `/api/providers/${id}/models/available`)
 export const fetchProviderModelsDraft = (payload: ProviderPayload) =>
